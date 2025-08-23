@@ -1,18 +1,26 @@
 import psycopg2
 import sys
 import logging
-from config import DB_CONFIG
+from pathlib import Path
+
+# Add parent directory to path for config import
+sys.path.append(str(Path(__file__).parent.parent))
+from config import DB_CONFIG, LOG_CONFIG
 
 # Set up logging
+log_dir = Path(__file__).parent.parent / LOG_CONFIG['log_dir']
+log_dir.mkdir(exist_ok=True)
+
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=getattr(logging, LOG_CONFIG['level']),
+    format=LOG_CONFIG['format'],
     handlers=[
-        logging.FileHandler('db_setup.log'),
+        logging.FileHandler(log_dir / 'database_setup.log'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
+
 
 def create_database():
     """Create the supply_chain database if it doesn't exist."""
@@ -43,17 +51,16 @@ def create_database():
         logger.error(f"❌ Error creating database: {e}")
         return False
 
-def create_schemas_and_tables():
-    """Create schemas and tables in the supply_chain database."""
+
+def create_bronze_schema():
+    """Create bronze schema and tables."""
     try:
         conn = psycopg2.connect(**DB_CONFIG)
         cursor = conn.cursor()
 
-        # Create schemas
-        schemas = ['bronze', 'silver', 'gold']
-        for schema in schemas:
-            cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
-            logger.info(f"✓ Schema '{schema}' created/verified")
+        # Create bronze schema
+        cursor.execute("CREATE SCHEMA IF NOT EXISTS bronze")
+        logger.info("✓ Bronze schema created/verified")
 
         # Create suppliers table
         cursor.execute("""
@@ -75,7 +82,7 @@ def create_schemas_and_tables():
                 sku TEXT UNIQUE NOT NULL,
                 product_name TEXT NOT NULL,
                 unit_cost NUMERIC(10,2) NOT NULL,
-                supplier_id INT REFERENCES bronze.suppliers(supplier_id),
+                supplier_id INT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -99,13 +106,12 @@ def create_schemas_and_tables():
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bronze.inventory (
                 inventory_id SERIAL PRIMARY KEY,
-                product_id INT REFERENCES bronze.products(product_id),
-                warehouse_id INT REFERENCES bronze.warehouses(warehouse_id),
+                product_id INT,
+                warehouse_id INT,
                 quantity_on_hand INT NOT NULL,
                 last_stocked_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(product_id, warehouse_id)
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         logger.info("✓ Table 'bronze.inventory' created/verified")
@@ -114,12 +120,12 @@ def create_schemas_and_tables():
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bronze.shipments (
                 shipment_id SERIAL PRIMARY KEY,
-                product_id INT REFERENCES bronze.products(product_id),
-                warehouse_id INT REFERENCES bronze.warehouses(warehouse_id),
+                product_id INT,
+                warehouse_id INT,
                 quantity_shipped INT NOT NULL,
                 shipment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 destination TEXT NOT NULL,
-                status TEXT CHECK (status IN ('In Transit','Delivered','Delayed','Cancelled')),
+                status TEXT CHECK (status IN ('In Transit','Delivered','Delayed','Cancelled','Pending','Returned')),
                 weight_kg NUMERIC(10,2),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -142,14 +148,20 @@ def create_schemas_and_tables():
         return True
 
     except psycopg2.Error as e:
-        logger.error(f"❌ Error creating schemas/tables: {e}")
+        logger.error(f"❌ Error creating bronze schema/tables: {e}")
         return False
+
 
 def create_silver_gold_views():
     """Create views and tables for Silver and Gold layers."""
     try:
         conn = psycopg2.connect(**DB_CONFIG)
         cursor = conn.cursor()
+
+        # Create silver and gold schemas
+        cursor.execute("CREATE SCHEMA IF NOT EXISTS silver")
+        cursor.execute("CREATE SCHEMA IF NOT EXISTS gold")
+        logger.info("✓ Silver and Gold schemas created/verified")
 
         # Silver layer - cleaned and validated data
         cursor.execute("""
@@ -175,11 +187,9 @@ def create_silver_gold_views():
                 TRIM(p.product_name) as product_name,
                 p.unit_cost,
                 p.supplier_id,
-                s.supplier_name,
                 p.created_at,
                 p.updated_at
             FROM bronze.products p
-            JOIN bronze.suppliers s ON p.supplier_id = s.supplier_id
             WHERE p.unit_cost > 0
         """)
 
@@ -191,11 +201,11 @@ def create_silver_gold_views():
                 w.location_city,
                 COUNT(DISTINCT i.product_id) as total_products,
                 SUM(i.quantity_on_hand) as total_inventory,
-                SUM(i.quantity_on_hand * p.unit_cost) as total_inventory_value,
+                SUM(i.quantity_on_hand * COALESCE(p.unit_cost, 0)) as total_inventory_value,
                 AVG(p.unit_cost) as avg_product_cost
             FROM bronze.inventory i
             JOIN bronze.warehouses w ON i.warehouse_id = w.warehouse_id
-            JOIN bronze.products p ON i.product_id = p.product_id
+            LEFT JOIN bronze.products p ON i.product_id = p.product_id
             GROUP BY w.warehouse_id, w.warehouse_name, w.location_city
         """)
 
@@ -224,6 +234,7 @@ def create_silver_gold_views():
         logger.error(f"❌ Error creating Silver/Gold views: {e}")
         return False
 
+
 def test_connection():
     """Test the database connection and verify table structure."""
     try:
@@ -234,39 +245,19 @@ def test_connection():
         cursor.execute("SELECT version()")
         version = cursor.fetchone()[0]
         logger.info(f"✓ Successfully connected to PostgreSQL")
-        logger.info(f"  Version: {version}")
 
         # Test table access and show record counts
         tables = ['suppliers', 'products', 'warehouses', 'inventory', 'shipments']
-        logger.info("\nTable Status:")
-        logger.info("-" * 30)
+        logger.info("\n📊 Bronze Layer Tables:")
+        logger.info("-" * 40)
 
         for table in tables:
             try:
                 cursor.execute(f"SELECT COUNT(*) FROM bronze.{table}")
                 count = cursor.fetchone()[0]
-                logger.info(f"✓ bronze.{table:<12}: {count:>6} records")
+                logger.info(f"  ✓ {table:<12}: {count:>8,} records")
             except psycopg2.Error as e:
-                logger.error(f"❌ Error accessing bronze.{table}: {e}")
-
-        # Test views
-        logger.info("\nViews Status:")
-        logger.info("-" * 30)
-
-        views = [
-            ('silver.suppliers_clean', 'Silver suppliers'),
-            ('silver.products_clean', 'Silver products'),
-            ('gold.inventory_summary', 'Gold inventory summary'),
-            ('gold.shipment_metrics', 'Gold shipment metrics')
-        ]
-
-        for view_name, description in views:
-            try:
-                cursor.execute(f"SELECT COUNT(*) FROM {view_name}")
-                count = cursor.fetchone()[0]
-                logger.info(f"✓ {description:<20}: {count:>6} records")
-            except psycopg2.Error as e:
-                logger.warning(f"⚠ {description}: View not accessible")
+                logger.error(f"  ❌ Error accessing bronze.{table}: {e}")
 
         cursor.close()
         conn.close()
@@ -280,14 +271,10 @@ def test_connection():
         logger.info("3. Ensure the user has necessary permissions")
         return False
 
+
 def drop_all_tables():
     """Drop all tables and schemas - USE WITH CAUTION!"""
     logger.warning("⚠️  WARNING: This will delete ALL data!")
-    response = input("Are you sure you want to drop all tables? (type 'YES' to confirm): ")
-
-    if response != 'YES':
-        logger.info("Operation cancelled")
-        return False
 
     try:
         conn = psycopg2.connect(**DB_CONFIG)
@@ -310,66 +297,43 @@ def drop_all_tables():
         cursor.close()
         conn.close()
 
-        logger.info("✓ All tables and schemas dropped successfully")
+        logger.info("✅ All tables and schemas dropped successfully")
         return True
 
     except psycopg2.Error as e:
         logger.error(f"❌ Error dropping tables: {e}")
         return False
 
+
 def main():
     """Main setup function."""
-    logger.info("🚀 Setting up Supply Chain Database...")
+    logger.info("🚀 Setting up Medallion Database - Bronze Layer")
     logger.info("=" * 60)
 
-    # Check if user wants to reset database
-    if len(sys.argv) > 1 and sys.argv[1] == '--reset':
-        logger.info("Reset mode enabled - dropping existing tables...")
-        drop_all_tables()
-
-    logger.info("\n1. Testing initial connection...")
-    # First try to connect to postgres database
-    default_config = DB_CONFIG.copy()
-    default_config['database'] = 'postgres'
-
-    try:
-        conn = psycopg2.connect(**default_config)
-        conn.close()
-        logger.info("✓ Successfully connected to PostgreSQL server")
-    except psycopg2.Error as e:
-        logger.error(f"❌ Cannot connect to PostgreSQL server: {e}")
-        logger.info("\n🔧 Please check:")
-        logger.info("- PostgreSQL is installed and running")
-        logger.info("- Username and password in config.py are correct")
-        logger.info("- PostgreSQL is accepting connections on localhost:5432")
-        sys.exit(1)
-
-    logger.info("\n2. Creating database...")
+    logger.info("1. Creating database...")
     if not create_database():
+        logger.error("❌ Failed to create database")
         sys.exit(1)
 
-    logger.info("\n3. Creating schemas and tables...")
-    if not create_schemas_and_tables():
+    logger.info("2. Creating bronze schema and tables...")
+    if not create_bronze_schema():
+        logger.error("❌ Failed to create bronze schema")
         sys.exit(1)
 
-    logger.info("\n4. Creating Silver and Gold layer views...")
+    logger.info("3. Creating silver and gold views...")
     if not create_silver_gold_views():
         logger.warning("⚠️  Failed to create views, but continuing...")
 
-    logger.info("\n5. Testing final connection and verifying setup...")
+    logger.info("4. Testing connection...")
     if not test_connection():
+        logger.error("❌ Connection test failed")
         sys.exit(1)
 
-    logger.info("\n🎉 Database setup completed successfully!")
-    logger.info("\nNext steps:")
-    logger.info("1. Run: python data_loader.py")
-    logger.info("2. Check logs in: db_setup.log and data_pipeline.log")
-    logger.info("\nDatabase connection details:")
-    logger.info(f"  Host: {DB_CONFIG['host']}")
-    logger.info(f"  Database: {DB_CONFIG['database']}")
-    logger.info(f"  User: {DB_CONFIG['user']}")
-    logger.info(f"  Port: {DB_CONFIG['port']}")
-    logger.info("\nTo reset database: python db_setup.py --reset")
+    logger.info("\n🎉 Bronze Layer Database Setup Completed Successfully!")
+    logger.info("=" * 60)
+    logger.info("Next step: Run bronze/data_loader.py to load data")
+    logger.info(f"Database: {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
+
 
 if __name__ == "__main__":
     main()
