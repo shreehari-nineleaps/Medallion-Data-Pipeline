@@ -66,11 +66,9 @@ def create_bronze_schema():
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bronze.suppliers (
                 supplier_id INT PRIMARY KEY,
-                supplier_name TEXT NOT NULL,
-                contact_email TEXT NOT NULL,
-                phone_number TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                supplier_name TEXT,
+                contact_email TEXT,
+                phone_number TEXT
             )
         """)
         logger.info("✓ Table 'bronze.suppliers' created/verified")
@@ -79,14 +77,12 @@ def create_bronze_schema():
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bronze.products (
                 product_id INT PRIMARY KEY,
-                product_name TEXT NOT NULL,
-                unit_cost NUMERIC(10,2) NOT NULL,
-                selling_price NUMERIC(10,2) NOT NULL,
-                supplier_id INT REFERENCES bronze.suppliers(supplier_id),
-                product_category TEXT NOT NULL,
-                status TEXT DEFAULT 'active' CHECK (status IN ('active','discontinued')),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                product_name TEXT,
+                unit_cost NUMERIC(15,6),
+                selling_price NUMERIC(15,6),
+                supplier_id INT,
+                product_category TEXT,
+                status TEXT
             )
         """)
         logger.info("✓ Table 'bronze.products' created/verified")
@@ -95,12 +91,10 @@ def create_bronze_schema():
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bronze.warehouses (
                 warehouse_id INT PRIMARY KEY,
-                warehouse_name TEXT NOT NULL,
-                city TEXT NOT NULL,
-                region TEXT NOT NULL,
-                storage_capacity INT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                warehouse_name TEXT,
+                city TEXT,
+                region TEXT,
+                storage_capacity INT
             )
         """)
         logger.info("✓ Table 'bronze.warehouses' created/verified")
@@ -109,12 +103,10 @@ def create_bronze_schema():
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bronze.inventory (
                 inventory_id INT PRIMARY KEY,
-                product_id INT REFERENCES bronze.products(product_id),
-                warehouse_id INT REFERENCES bronze.warehouses(warehouse_id),
-                quantity_on_hand INT NOT NULL,
-                last_stocked_date DATE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                product_id INT,
+                warehouse_id INT,
+                quantity_on_hand INT,
+                last_stocked_date DATE
             )
         """)
         logger.info("✓ Table 'bronze.inventory' created/verified")
@@ -123,13 +115,11 @@ def create_bronze_schema():
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bronze.retail_stores (
                 retail_store_id INT PRIMARY KEY,
-                store_name TEXT NOT NULL,
-                city TEXT NOT NULL,
-                region TEXT NOT NULL,
-                store_type TEXT NOT NULL,
-                store_status TEXT DEFAULT 'active' CHECK (store_status IN ('active','closed','under renovation')),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                store_name TEXT,
+                city TEXT,
+                region TEXT,
+                store_type TEXT,
+                store_status TEXT
             )
         """)
         logger.info("✓ Table 'bronze.retail_stores' created/verified")
@@ -138,18 +128,16 @@ def create_bronze_schema():
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS bronze.supply_orders (
                 supply_order_id INT PRIMARY KEY,
-                product_id INT REFERENCES bronze.products(product_id),
-                warehouse_id INT REFERENCES bronze.warehouses(warehouse_id),
-                retail_store_id INT REFERENCES bronze.retail_stores(retail_store_id),
-                quantity INT NOT NULL,
-                price NUMERIC(10,2) NOT NULL,
-                total_invoice NUMERIC(12,2) NOT NULL,
-                order_date DATE NOT NULL,
-                shipped_date DATE,
-                delivered_date DATE,
-                status TEXT DEFAULT 'pending' CHECK (status IN ('pending','shipped','delivered','canceled')),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                product_id TEXT,
+                warehouse_id TEXT,
+                retail_store_id TEXT,
+                quantity TEXT,
+                price TEXT,
+                total_invoice TEXT,
+                order_date TEXT,
+                shipped_date TEXT,
+                delivered_date TEXT,
+                status TEXT
             )
         """)
         logger.info("✓ Table 'bronze.supply_orders' created/verified")
