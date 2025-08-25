@@ -1,9 +1,8 @@
-import os
 import logging
 import httplib2
 import pandas as pd
 import psycopg2
-from psycopg2.extras import RealDictCursor
+
 from google_auth_httplib2 import AuthorizedHttp
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -89,27 +88,42 @@ def load_suppliers_to_bronze(df):
 
     try:
         cursor = conn.cursor()
-        insert_query = """
-        INSERT INTO bronze.suppliers (supplier_name, contact_email, phone_number)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (contact_email) DO UPDATE SET
+
+        # Get initial count
+        cursor.execute("SELECT COUNT(*) FROM bronze.suppliers")
+        initial_count = cursor.fetchone()[0]
+
+        # Use UPSERT to prevent duplicates
+        upsert_query = """
+        INSERT INTO bronze.suppliers (supplier_id, supplier_name, contact_email, phone_number)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (supplier_id) DO UPDATE SET
             supplier_name = EXCLUDED.supplier_name,
+            contact_email = EXCLUDED.contact_email,
             phone_number = EXCLUDED.phone_number,
-            updated_at = CURRENT_TIMESTAMP;
+            updated_at = CURRENT_TIMESTAMP
         """
 
         for _, row in df.iterrows():
-            cursor.execute(insert_query, (
+            cursor.execute(upsert_query, (
+                int(row['supplier_id']),
                 row['supplier_name'],
                 row['contact_email'],
                 row['phone_number']
             ))
 
+        # Get final count
+        cursor.execute("SELECT COUNT(*) FROM bronze.suppliers")
+        final_count = cursor.fetchone()[0]
+
+        inserted = final_count - initial_count
+        updated = len(df) - inserted
+
         conn.commit()
-        logger.info(f"Successfully loaded {len(df):,} suppliers to bronze layer")
+        logger.info(f"Successfully processed {len(df):,} suppliers: {inserted:,} inserted, {updated:,} updated")
         return True
 
-    except psycopg2.Error as e:
+    except (psycopg2.Error, ValueError) as e:
         logger.error(f"Error loading suppliers data: {e}")
         conn.rollback()
         return False
@@ -130,24 +144,41 @@ def load_warehouses_to_bronze(df):
 
     try:
         cursor = conn.cursor()
-        insert_query = """
-        INSERT INTO bronze.warehouses (warehouse_name, location_city, storage_capacity)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (warehouse_name) DO UPDATE SET
-            location_city = EXCLUDED.location_city,
+
+        # Get initial count
+        cursor.execute("SELECT COUNT(*) FROM bronze.warehouses")
+        initial_count = cursor.fetchone()[0]
+
+        # Use UPSERT to prevent duplicates
+        upsert_query = """
+        INSERT INTO bronze.warehouses (warehouse_id, warehouse_name, city, region, storage_capacity)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (warehouse_id) DO UPDATE SET
+            warehouse_name = EXCLUDED.warehouse_name,
+            city = EXCLUDED.city,
+            region = EXCLUDED.region,
             storage_capacity = EXCLUDED.storage_capacity,
-            updated_at = CURRENT_TIMESTAMP;
+            updated_at = CURRENT_TIMESTAMP
         """
 
         for _, row in df.iterrows():
-            cursor.execute(insert_query, (
+            cursor.execute(upsert_query, (
+                int(row['warehouse_id']),
                 row['warehouse_name'],
-                row['location_city'],
+                row['city'],
+                row['region'],
                 int(row['storage_capacity'])
             ))
 
+        # Get final count
+        cursor.execute("SELECT COUNT(*) FROM bronze.warehouses")
+        final_count = cursor.fetchone()[0]
+
+        inserted = final_count - initial_count
+        updated = len(df) - inserted
+
         conn.commit()
-        logger.info(f"Successfully loaded {len(df):,} warehouses to bronze layer")
+        logger.info(f"Successfully processed {len(df):,} warehouses: {inserted:,} inserted, {updated:,} updated")
         return True
 
     except (psycopg2.Error, ValueError) as e:
@@ -171,26 +202,45 @@ def load_products_to_bronze(df):
 
     try:
         cursor = conn.cursor()
-        insert_query = """
-        INSERT INTO bronze.products (sku, product_name, unit_cost, supplier_id)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (sku) DO UPDATE SET
+
+        # Get initial count
+        cursor.execute("SELECT COUNT(*) FROM bronze.products")
+        initial_count = cursor.fetchone()[0]
+
+        # Use UPSERT to prevent duplicates
+        upsert_query = """
+        INSERT INTO bronze.products (product_id, product_name, unit_cost, selling_price, supplier_id, product_category, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (product_id) DO UPDATE SET
             product_name = EXCLUDED.product_name,
             unit_cost = EXCLUDED.unit_cost,
+            selling_price = EXCLUDED.selling_price,
             supplier_id = EXCLUDED.supplier_id,
-            updated_at = CURRENT_TIMESTAMP;
+            product_category = EXCLUDED.product_category,
+            status = EXCLUDED.status,
+            updated_at = CURRENT_TIMESTAMP
         """
 
         for _, row in df.iterrows():
-            cursor.execute(insert_query, (
-                row['sku'],
+            cursor.execute(upsert_query, (
+                int(row['product_id']),
                 row['product_name'],
                 float(row['unit_cost']),
-                int(row['supplier_id'])
+                float(row['selling_price']),
+                int(row['supplier_id']),
+                row['product_category'],
+                row.get('status', 'active')
             ))
 
+        # Get final count
+        cursor.execute("SELECT COUNT(*) FROM bronze.products")
+        final_count = cursor.fetchone()[0]
+
+        inserted = final_count - initial_count
+        updated = len(df) - inserted
+
         conn.commit()
-        logger.info(f"Successfully loaded {len(df):,} products to bronze layer")
+        logger.info(f"Successfully processed {len(df):,} products: {inserted:,} inserted, {updated:,} updated")
         return True
 
     except (psycopg2.Error, ValueError) as e:
@@ -214,24 +264,44 @@ def load_inventory_to_bronze(df):
 
     try:
         cursor = conn.cursor()
-        insert_query = """
-        INSERT INTO bronze.inventory (product_id, warehouse_id, quantity_on_hand, last_stocked_date)
-        VALUES (%s, %s, %s, %s)
+
+        # Get initial count
+        cursor.execute("SELECT COUNT(*) FROM bronze.inventory")
+        initial_count = cursor.fetchone()[0]
+
+        # Use UPSERT to prevent duplicates
+        upsert_query = """
+        INSERT INTO bronze.inventory (inventory_id, product_id, warehouse_id, quantity_on_hand, last_stocked_date)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (inventory_id) DO UPDATE SET
+            product_id = EXCLUDED.product_id,
+            warehouse_id = EXCLUDED.warehouse_id,
+            quantity_on_hand = EXCLUDED.quantity_on_hand,
+            last_stocked_date = EXCLUDED.last_stocked_date,
+            updated_at = CURRENT_TIMESTAMP
         """
 
         for _, row in df.iterrows():
             # Convert last_stocked_date to proper format
-            last_stocked = pd.to_datetime(row['last_stocked_date']).strftime('%Y-%m-%d %H:%M:%S')
+            last_stocked = pd.to_datetime(row['last_stocked_date']).strftime('%Y-%m-%d')
 
-            cursor.execute(insert_query, (
+            cursor.execute(upsert_query, (
+                int(row['inventory_id']),
                 int(row['product_id']),
                 int(row['warehouse_id']),
                 int(row['quantity_on_hand']),
                 last_stocked
             ))
 
+        # Get final count
+        cursor.execute("SELECT COUNT(*) FROM bronze.inventory")
+        final_count = cursor.fetchone()[0]
+
+        inserted = final_count - initial_count
+        updated = len(df) - inserted
+
         conn.commit()
-        logger.info(f"Successfully loaded {len(df):,} inventory records to bronze layer")
+        logger.info(f"Successfully processed {len(df):,} inventory records: {inserted:,} inserted, {updated:,} updated")
         return True
 
     except (psycopg2.Error, ValueError) as e:
@@ -243,10 +313,10 @@ def load_inventory_to_bronze(df):
         conn.close()
 
 
-def load_shipments_to_bronze(df):
-    """Load shipments data to PostgreSQL bronze.shipments table."""
+def load_retail_stores_to_bronze(df):
+    """Load retail stores data to PostgreSQL bronze.retail_stores table."""
     if df.empty:
-        logger.warning("No shipments data to load")
+        logger.warning("No retail stores data to load")
         return False
 
     conn = get_db_connection()
@@ -255,32 +325,124 @@ def load_shipments_to_bronze(df):
 
     try:
         cursor = conn.cursor()
-        insert_query = """
-        INSERT INTO bronze.shipments (product_id, warehouse_id, quantity_shipped,
-                                    shipment_date, destination, status, weight_kg)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+
+        # Get initial count
+        cursor.execute("SELECT COUNT(*) FROM bronze.retail_stores")
+        initial_count = cursor.fetchone()[0]
+
+        # Use UPSERT to prevent duplicates
+        upsert_query = """
+        INSERT INTO bronze.retail_stores (retail_store_id, store_name, city, region, store_type, store_status)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (retail_store_id) DO UPDATE SET
+            store_name = EXCLUDED.store_name,
+            city = EXCLUDED.city,
+            region = EXCLUDED.region,
+            store_type = EXCLUDED.store_type,
+            store_status = EXCLUDED.store_status,
+            updated_at = CURRENT_TIMESTAMP
         """
 
         for _, row in df.iterrows():
-            # Convert shipment_date to proper format
-            shipment_date = pd.to_datetime(row['shipment_date']).strftime('%Y-%m-%d %H:%M:%S')
-
-            cursor.execute(insert_query, (
-                int(row['product_id']),
-                int(row['warehouse_id']),
-                int(row['quantity_shipped']),
-                shipment_date,
-                row['destination'],
-                row['status'],
-                float(row['weight_kg'])
+            cursor.execute(upsert_query, (
+                int(row['retail_store_id']),
+                row['store_name'],
+                row['city'],
+                row['region'],
+                row['store_type'],
+                row.get('store_status', 'active')
             ))
 
+        # Get final count
+        cursor.execute("SELECT COUNT(*) FROM bronze.retail_stores")
+        final_count = cursor.fetchone()[0]
+
+        inserted = final_count - initial_count
+        updated = len(df) - inserted
+
         conn.commit()
-        logger.info(f"Successfully loaded {len(df):,} shipment records to bronze layer")
+        logger.info(f"Successfully processed {len(df):,} retail stores: {inserted:,} inserted, {updated:,} updated")
         return True
 
     except (psycopg2.Error, ValueError) as e:
-        logger.error(f"Error loading shipments data: {e}")
+        logger.error(f"Error loading retail stores data: {e}")
+        conn.rollback()
+        return False
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def load_supply_orders_to_bronze(df):
+    """Load supply orders data to PostgreSQL bronze.supply_orders table."""
+    if df.empty:
+        logger.warning("No supply orders data to load")
+        return False
+
+    conn = get_db_connection()
+    if not conn:
+        return False
+
+    try:
+        cursor = conn.cursor()
+
+        # Get initial count
+        cursor.execute("SELECT COUNT(*) FROM bronze.supply_orders")
+        initial_count = cursor.fetchone()[0]
+
+        # Use UPSERT to prevent duplicates
+        upsert_query = """
+        INSERT INTO bronze.supply_orders (supply_order_id, product_id, warehouse_id, retail_store_id,
+                                        quantity, price, total_invoice, order_date, shipped_date,
+                                        delivered_date, status)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (supply_order_id) DO UPDATE SET
+            product_id = EXCLUDED.product_id,
+            warehouse_id = EXCLUDED.warehouse_id,
+            retail_store_id = EXCLUDED.retail_store_id,
+            quantity = EXCLUDED.quantity,
+            price = EXCLUDED.price,
+            total_invoice = EXCLUDED.total_invoice,
+            order_date = EXCLUDED.order_date,
+            shipped_date = EXCLUDED.shipped_date,
+            delivered_date = EXCLUDED.delivered_date,
+            status = EXCLUDED.status,
+            updated_at = CURRENT_TIMESTAMP
+        """
+
+        for _, row in df.iterrows():
+            # Convert dates to proper format
+            order_date = pd.to_datetime(row['order_date']).strftime('%Y-%m-%d')
+            shipped_date = pd.to_datetime(row['shipped_date']).strftime('%Y-%m-%d') if pd.notna(row['shipped_date']) and row['shipped_date'] else None
+            delivered_date = pd.to_datetime(row['delivered_date']).strftime('%Y-%m-%d') if pd.notna(row['delivered_date']) and row['delivered_date'] else None
+
+            cursor.execute(upsert_query, (
+                int(row['supply_order_id']),
+                int(row['product_id']),
+                int(row['warehouse_id']),
+                int(row['retail_store_id']),
+                int(row['quantity']),
+                float(row['price']),
+                float(row['total_invoice']),
+                order_date,
+                shipped_date,
+                delivered_date,
+                row.get('status', 'pending')
+            ))
+
+        # Get final count
+        cursor.execute("SELECT COUNT(*) FROM bronze.supply_orders")
+        final_count = cursor.fetchone()[0]
+
+        inserted = final_count - initial_count
+        updated = len(df) - inserted
+
+        conn.commit()
+        logger.info(f"Successfully processed {len(df):,} supply order records: {inserted:,} inserted, {updated:,} updated")
+        return True
+
+    except (psycopg2.Error, ValueError) as e:
+        logger.error(f"Error loading supply orders data: {e}")
         conn.rollback()
         return False
     finally:
@@ -314,7 +476,8 @@ def load_sheet_to_bronze(sheet_name):
         'products': load_products_to_bronze,
         'warehouses': load_warehouses_to_bronze,
         'inventory': load_inventory_to_bronze,
-        'shipments': load_shipments_to_bronze
+        'retail_stores': load_retail_stores_to_bronze,
+        'supply_orders': load_supply_orders_to_bronze
     }
 
     load_function = load_functions.get(sheet_name)
@@ -336,8 +499,8 @@ def load_all_data_to_bronze():
     logger.info("🚀 Starting Bronze Layer Data Loading Pipeline...")
     logger.info("=" * 80)
 
-    # Define loading order (suppliers and warehouses first, then products, inventory, shipments)
-    load_order = ['suppliers', 'warehouses', 'products', 'inventory', 'shipments']
+    # Define loading order (suppliers and warehouses first, then products, retail_stores, inventory, supply_orders)
+    load_order = ['suppliers', 'warehouses', 'products', 'retail_stores', 'inventory', 'supply_orders']
 
     results = {}
     for sheet_name in load_order:
@@ -380,7 +543,7 @@ def verify_bronze_data():
 
     try:
         cursor = conn.cursor()
-        tables = ['suppliers', 'products', 'warehouses', 'inventory', 'shipments']
+        tables = ['suppliers', 'products', 'warehouses', 'inventory', 'retail_stores', 'supply_orders']
 
         logger.info("\n📊 Bronze Layer Record Counts:")
         logger.info("=" * 50)
@@ -396,7 +559,7 @@ def verify_bronze_data():
         logger.info(f"  {'TOTAL':<12}: {total_records:>8,} records")
 
         # Show sample data from each table
-        logger.info(f"\n🔍 Sample Data Preview:")
+        logger.info("\n🔍 Sample Data Preview:")
         logger.info("=" * 50)
 
         for table in tables:

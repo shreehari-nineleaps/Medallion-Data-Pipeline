@@ -12,6 +12,7 @@ from datetime import datetime
 sys.path.append(str(Path(__file__).parent))
 from config import LOG_CONFIG
 from silver.silver_builder import SilverBuilder
+from gold.gold_builder import GoldBuilder
 
 # Set up logging
 log_dir = Path(__file__).parent / LOG_CONFIG['log_dir']
@@ -55,36 +56,7 @@ def build_silver():
 
     try:
         silver_builder = SilverBuilder()
-
-        # Step 1: Setup schemas and audit tables
-        logger.info("Step 1: Setting up Silver and Audit schemas...")
-        if not silver_builder.setup_schemas():
-            logger.error("Failed to setup schemas")
-            return False
-
-        # Step 2: Light cleaning in SQL (Bronze -> Silver base)
-        logger.info("Step 2: Performing light cleaning in SQL...")
-        if not silver_builder.create_silver_base_tables():
-            logger.error("Failed to create Silver base tables")
-            return False
-
-        # Step 3: Deep validation in Python
-        logger.info("Step 3: Performing deep validation in Python...")
-        if not silver_builder.deep_validation():
-            logger.error("Failed to perform deep validation")
-            return False
-
-        # Step 4: Data Quality checks
-        logger.info("Step 4: Running Data Quality checks...")
-        if not silver_builder.run_data_quality_checks():
-            logger.error("Failed to run DQ checks")
-            return False
-
-        # Log summary
-        silver_builder.log_summary()
-
-        logger.info("✅ Silver layer built successfully")
-        return True
+        return silver_builder.run_full_silver_pipeline()
 
     except Exception as e:
         logger.error(f"❌ Error building Silver layer: {e}")
@@ -94,8 +66,14 @@ def build_silver():
 def build_gold():
     """Build Gold layer - Create business metrics and aggregations."""
     logger.info("🥇 Building Gold Layer...")
-    logger.info("⚠️  Gold layer not yet implemented")
-    return True
+
+    try:
+        gold_builder = GoldBuilder()
+        return gold_builder.run_full_gold_pipeline()
+
+    except Exception as e:
+        logger.error(f"❌ Error building Gold layer: {e}")
+        return False
 
 
 def run_full_pipeline():

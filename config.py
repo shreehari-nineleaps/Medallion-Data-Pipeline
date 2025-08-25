@@ -19,10 +19,11 @@ GOOGLE_SHEETS_CONFIG = {
 # Sheet Ranges for different data types
 SHEET_RANGES = {
     'suppliers': 'Suppliers!A:D',
-    'products': 'Products!A:E',
-    'warehouses': 'Warehouses!A:D',
-    'inventory': 'Inventory!A:F',
-    'shipments': 'Shipments!A:H'
+    'products': 'Products!A:G',
+    'warehouses': 'Warehouses!A:E',
+    'inventory': 'Inventory!A:E',
+    'retail_stores': 'RetailStores!A:F',
+    'supply_orders': 'SupplyOrders!A:L'
 }
 
 # Logging Configuration

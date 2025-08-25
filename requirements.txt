@@ -2,6 +2,10 @@
 pandas==2.3.2
 numpy==2.3.2
 
+# Streamlit UI Framework
+streamlit==1.29.0
+plotly==5.17.0
+
 # Google Sheets API
 google-auth==2.40.3
 google-auth-oauthlib==1.2.2
@@ -12,6 +16,10 @@ httplib2==0.22.0
 # PostgreSQL and Database
 psycopg2-binary==2.9.10
 sqlalchemy==2.0.43
+
+# Visualization and Charts
+matplotlib==3.8.2
+seaborn==0.13.0
 
 # Additional dependencies
 cachetools==5.5.2
