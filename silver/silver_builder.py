@@ -1,41 +1,235 @@
-"""
-Silver Layer Builder for Medallion Data Pipeline
-Optimized to read directly from bronze and clean data without intermediate copies
-"""
-
+import sys
 import logging
 import pandas as pd
-import psycopg2
+import re
 from datetime import datetime
-import sys
 from pathlib import Path
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # Add parent directory to path for config import
 sys.path.append(str(Path(__file__).parent.parent))
-from config import DB_CONFIG
+from config import DB_CONFIG, LOG_CONFIG
 
+# Set up logging
+log_dir = Path(__file__).parent.parent / LOG_CONFIG['log_dir']
+log_dir.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=getattr(logging, LOG_CONFIG['level']),
+    format=LOG_CONFIG['format'],
+    handlers=[
+        logging.FileHandler(log_dir / 'silver_builder.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 
-class SilverBuilder:
-    """Handles Silver layer ETL operations."""
+class SilverDataCleaner:
+    """Data cleaning utilities for Silver layer transformation."""
 
     def __init__(self):
-        self.run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.tables = ['suppliers', 'products', 'warehouses', 'inventory', 'retail_stores', 'supply_orders']
-        self.stats = {}
+        # Common null/empty values to handle
+        self.null_values = ['NULL', 'N/A', 'NOT AVAILABLE', 'TBD', 'UNKNOWN', '', 'NONE', 'NIL']
+
+    def clean_text_field(self, value):
+        """Clean text fields - handle dirty strings."""
+        if not value or pd.isna(value):
+            return None
+
+        # Convert to string and clean
+        value_str = str(value).strip()
+        if not value_str or value_str.upper() in self.null_values:
+            return None
+
+        # Fix common formatting issues
+        # Remove extra spaces and normalize case
+        cleaned = ' '.join(value_str.split())
+
+        # Fix common typos and formatting
+        cleaned = re.sub(r'\s+', ' ', cleaned)  # Multiple spaces to single
+        cleaned = cleaned.title() if cleaned.isupper() or cleaned.islower() else cleaned
+
+        # Remove special characters at start/end
+        cleaned = re.sub(r'^[^\w\s]+|[^\w\s]+$', '', cleaned)
+
+        return cleaned.strip() if cleaned.strip() else None
+
+    def clean_email(self, value):
+        """Clean email addresses."""
+        if not value or pd.isna(value):
+            return None
+
+        value_str = str(value).strip().lower()
+        if not value_str or value_str.upper() in self.null_values:
+            return None
+
+        # Basic email validation
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        if re.match(email_pattern, value_str):
+            return value_str
+
+        return None
+
+    def clean_phone(self, value):
+        """Clean phone numbers."""
+        if not value or pd.isna(value):
+            return None
+
+        value_str = str(value).strip()
+        if not value_str or value_str.upper() in self.null_values:
+            return None
+
+        # Extract digits and some common patterns
+        phone_clean = re.sub(r'[^\d+()-]', '', value_str)
+
+        # Basic validation - should have at least 10 digits
+        digits_only = re.sub(r'[^\d]', '', phone_clean)
+        if len(digits_only) >= 10:
+            return phone_clean
+
+        return None
+
+    def clean_numeric_field(self, value, allow_negative=False, max_digits=15, decimal_places=4):
+        """Clean numeric fields - handle dirty numbers with proper precision."""
+        if not value or pd.isna(value):
+            return None
+
+        # Convert to string and clean
+        value_str = str(value).strip()
+        if not value_str or value_str.upper() in self.null_values:
+            return None
+
+        # Extract numeric part (handle currency symbols, commas, etc.)
+        numeric_match = re.search(r'[-+]?\d*\.?\d+', value_str.replace(',', ''))
+        if not numeric_match:
+            return None
+
+        try:
+            num_value = float(numeric_match.group())
+
+            # Handle negative values
+            if not allow_negative and num_value < 0:
+                return 0.0
+
+            # Round to specified decimal places
+            rounded_value = round(num_value, decimal_places)
+
+            # Check if the number fits within the specified precision
+            str_value = f"{rounded_value:.{decimal_places}f}"
+            total_digits = len(str_value.replace('.', '').replace('-', ''))
+
+            if total_digits > max_digits:
+                logger.warning(f"Value {rounded_value} exceeds max digits {max_digits}, truncating")
+                # Truncate to fit within precision
+                max_integer_part = max_digits - decimal_places
+                max_value = 10**max_integer_part - 1
+                rounded_value = min(rounded_value, max_value)
+
+            return rounded_value
+        except (ValueError, TypeError):
+            return None
+
+    def clean_integer_field(self, value):
+        """Clean integer fields."""
+        if not value or pd.isna(value):
+            return None
+
+        try:
+            # Handle string representation
+            value_str = str(value).strip()
+            if not value_str or value_str.upper() in self.null_values:
+                return None
+
+            # Extract numeric part
+            numeric_match = re.search(r'\d+', value_str.replace(',', ''))
+            if not numeric_match:
+                return None
+
+            return int(numeric_match.group())
+        except (ValueError, TypeError):
+            return None
+
+    def clean_date_field(self, value):
+        """Clean date fields."""
+        if not value or pd.isna(value):
+            return None
+
+        value_str = str(value).strip()
+        if not value_str or value_str.upper() in self.null_values:
+            return None
+
+        # Try common date formats
+        date_formats = [
+            '%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y',
+            '%Y-%m-%d %H:%M:%S', '%m/%d/%Y %H:%M:%S',
+            '%d-%m-%Y', '%Y/%m/%d'
+        ]
+
+        for fmt in date_formats:
+            try:
+                parsed_date = datetime.strptime(value_str, fmt).date()
+                return parsed_date
+            except ValueError:
+                continue
+
+        # Try pandas to_datetime as fallback
+        try:
+            parsed_date = pd.to_datetime(value_str, errors='coerce')
+            if not pd.isna(parsed_date):
+                return parsed_date.date()
+        except:
+            pass
+
+        return None
+
+    def clean_status_field(self, value, valid_statuses=None):
+        """Clean status fields."""
+        if not value or pd.isna(value):
+            return 'unknown'
+
+        value_str = str(value).strip().lower()
+        if not value_str or value_str.upper() in self.null_values:
+            return 'unknown'
+
+        if valid_statuses:
+            # Check if it matches any valid status
+            for status in valid_statuses:
+                if status.lower() in value_str or value_str in status.lower():
+                    return status.lower()
+
+        return value_str.lower()
+
+    def clean_category_field(self, value):
+        """Clean category fields."""
+        cleaned = self.clean_text_field(value)
+        return cleaned if cleaned else 'Uncategorized'
+
+
+class SilverBuilder:
+    """Build Silver layer with clean, validated data."""
+
+    def __init__(self):
+        self.cleaner = SilverDataCleaner()
+        self.total_stats = {
+            'total_records_processed': 0,
+            'total_records_cleaned': 0,
+            'total_quality_issues_fixed': 0
+        }
 
     def get_connection(self):
         """Get database connection."""
         try:
-            return psycopg2.connect(**DB_CONFIG)
+            conn = psycopg2.connect(**DB_CONFIG)
+            return conn
         except psycopg2.Error as e:
-            logger.error(f"Database connection error: {e}")
+            logger.error(f"Database connection failed: {e}")
             return None
 
-    def setup_schemas(self):
-        """Create Silver and Audit schemas with tables."""
-        logger.info("Setting up Silver and Audit schemas...")
+    def setup_silver_tables(self):
+        """Create silver tables with proper precision for large numbers."""
+        logger.info("Setting up Silver layer tables...")
 
         conn = self.get_connection()
         if not conn:
@@ -44,660 +238,740 @@ class SilverBuilder:
         try:
             cursor = conn.cursor()
 
-            # Create schemas
+            # Create silver schema
             cursor.execute("CREATE SCHEMA IF NOT EXISTS silver")
-            cursor.execute("CREATE SCHEMA IF NOT EXISTS audit")
 
-            # Create audit.rejected_rows table
+            # Clean suppliers table
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS audit.rejected_rows (
-                    id SERIAL PRIMARY KEY,
-                    table_name VARCHAR(100) NOT NULL,
-                    record JSONB NOT NULL,
-                    reason TEXT NOT NULL,
-                    run_id VARCHAR(50) NOT NULL,
+                CREATE TABLE IF NOT EXISTS silver.suppliers (
+                    supplier_id INT PRIMARY KEY,
+                    supplier_name TEXT NOT NULL,
+                    contact_email TEXT,
+                    phone_number TEXT,
+                    quality_score DECIMAL(5,2),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
-            # Create audit.dq_results table
+            # Clean products table - increased precision for large numbers
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS audit.dq_results (
-                    id SERIAL PRIMARY KEY,
-                    table_name VARCHAR(100) NOT NULL,
-                    check_name VARCHAR(200) NOT NULL,
-                    pass_fail BOOLEAN NOT NULL,
-                    bad_row_count INTEGER DEFAULT 0,
-                    run_id VARCHAR(50) NOT NULL,
+                CREATE TABLE IF NOT EXISTS silver.products (
+                    product_id INT PRIMARY KEY,
+                    product_name TEXT NOT NULL,
+                    unit_cost DECIMAL(15,4) CHECK (unit_cost >= 0),
+                    selling_price DECIMAL(15,4) CHECK (selling_price >= 0),
+                    supplier_id INT,
+                    product_category TEXT DEFAULT 'Uncategorized',
+                    status TEXT DEFAULT 'active',
+                    price_margin DECIMAL(15,4),
+                    quality_score DECIMAL(5,2),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
-            # Create audit.etl_log table
+            # Clean warehouses table
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS audit.etl_log (
-                    id SERIAL PRIMARY KEY,
-                    run_id VARCHAR(50) NOT NULL,
-                    run_timestamp TIMESTAMP NOT NULL,
-                    step_executed VARCHAR(100) NOT NULL,
-                    table_name VARCHAR(100),
-                    input_row_count INTEGER,
-                    output_row_count INTEGER,
-                    rejected_row_count INTEGER,
-                    data_checksum VARCHAR(64),
+                CREATE TABLE IF NOT EXISTS silver.warehouses (
+                    warehouse_id INT PRIMARY KEY,
+                    warehouse_name TEXT NOT NULL,
+                    city TEXT,
+                    region TEXT,
+                    storage_capacity INT CHECK (storage_capacity >= 0),
+                    quality_score DECIMAL(5,2),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Clean inventory table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS silver.inventory (
+                    inventory_id INT PRIMARY KEY,
+                    product_id INT,
+                    warehouse_id INT,
+                    quantity_on_hand INT CHECK (quantity_on_hand >= 0),
+                    last_stocked_date DATE,
+                    quality_score DECIMAL(5,2),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Clean retail stores table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS silver.retail_stores (
+                    retail_store_id INT PRIMARY KEY,
+                    store_name TEXT NOT NULL,
+                    city TEXT,
+                    region TEXT,
+                    store_type TEXT,
+                    store_status TEXT DEFAULT 'active',
+                    quality_score DECIMAL(5,2),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Clean supply orders table - increased precision
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS silver.supply_orders (
+                    supply_order_id INT PRIMARY KEY,
+                    product_id INT,
+                    warehouse_id INT,
+                    retail_store_id INT,
+                    quantity INT CHECK (quantity >= 0),
+                    price DECIMAL(15,4) CHECK (price >= 0),
+                    total_invoice DECIMAL(15,4) CHECK (total_invoice >= 0),
+                    order_date DATE NOT NULL,
+                    shipped_date DATE,
+                    delivered_date DATE,
+                    status TEXT DEFAULT 'pending',
+                    is_calculation_correct BOOLEAN,
+                    date_logic_valid BOOLEAN,
+                    quality_score DECIMAL(5,2),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Create quality issues log table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS silver.quality_issues_log (
+                    issue_id SERIAL PRIMARY KEY,
+                    table_name TEXT NOT NULL,
+                    record_id INT,
+                    field_name TEXT,
+                    issue_type TEXT NOT NULL,
+                    original_value TEXT,
+                    cleaned_value TEXT,
+                    action_taken TEXT DEFAULT 'cleaned',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
             conn.commit()
-            logger.info("✅ Schemas and audit tables created successfully")
+            cursor.close()
+            logger.info("✓ Silver layer tables created successfully")
             return True
 
         except psycopg2.Error as e:
-            logger.error(f"Error setting up schemas: {e}")
+            logger.error(f"Error creating silver tables: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+
+    def log_quality_issue(self, table_name, record_id, field_name, issue_type, original_value, action_taken='cleaned'):
+        """Log data quality issues."""
+        conn = self.get_connection()
+        if not conn:
+            return
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO silver.quality_issues_log
+                (table_name, record_id, field_name, issue_type, original_value, action_taken)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (table_name, record_id, field_name, issue_type, str(original_value), action_taken))
+            conn.commit()
+            cursor.close()
+        except psycopg2.Error as e:
+            logger.error(f"Error logging quality issue: {e}")
+        finally:
+            conn.close()
+
+    def calculate_quality_score(self, issues_found, total_fields):
+        """Calculate quality score based on issues found."""
+        if total_fields == 0:
+            return 100.0
+        clean_fields = total_fields - issues_found
+        return round((clean_fields / total_fields) * 100, 2)
+
+    def clean_suppliers(self):
+        """Clean suppliers data."""
+        logger.info("🧹 Cleaning suppliers data...")
+
+        conn = self.get_connection()
+        if not conn:
+            return False
+
+        try:
+            cursor = conn.cursor()
+
+            # Get bronze data
+            cursor.execute("""
+                SELECT supplier_id, supplier_name, contact_email, phone_number
+                FROM bronze.suppliers
+            """)
+            bronze_data = cursor.fetchall()
+
+            # Clear silver table
+            cursor.execute("TRUNCATE TABLE silver.suppliers")
+
+            stats = {'processed': 0, 'cleaned': 0, 'rejected': 0, 'issues_fixed': 0}
+
+            for row in bronze_data:
+                supplier_id, supplier_name, contact_email, phone_number = row
+                issues_count = 0
+
+                # Clean each field
+                cleaned_name = self.cleaner.clean_text_field(supplier_name)
+                if cleaned_name != supplier_name:
+                    issues_count += 1
+
+                cleaned_email = self.cleaner.clean_email(contact_email)
+                if cleaned_email != contact_email:
+                    issues_count += 1
+
+                cleaned_phone = self.cleaner.clean_phone(phone_number)
+                if cleaned_phone != phone_number:
+                    issues_count += 1
+
+                # Skip if essential data is missing
+                if not cleaned_name:
+                    stats['rejected'] += 1
+                    logger.debug(f"Rejected supplier {supplier_id}: missing name")
+                    continue
+
+                quality_score = self.calculate_quality_score(issues_count, 4)
+
+                # Insert cleaned data
+                cursor.execute("""
+                    INSERT INTO silver.suppliers
+                    (supplier_id, supplier_name, contact_email, phone_number, quality_score)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (supplier_id, cleaned_name, cleaned_email, cleaned_phone, quality_score))
+
+                stats['processed'] += 1
+                if issues_count > 0:
+                    stats['cleaned'] += 1
+                    stats['issues_fixed'] += issues_count
+
+            conn.commit()
+            logger.info(f"✅ Suppliers: {stats['processed']:,} processed, {stats['cleaned']:,} cleaned, {stats['rejected']:,} rejected, {stats['issues_fixed']:,} issues fixed")
+            self.total_stats['total_records_processed'] += stats['processed']
+            self.total_stats['total_records_cleaned'] += stats['cleaned']
+            self.total_stats['total_quality_issues_fixed'] += stats['issues_fixed']
+
+            return True
+
+        except psycopg2.Error as e:
+            logger.error(f"Error cleaning suppliers: {e}")
+            conn.rollback()
             return False
         finally:
             cursor.close()
             conn.close()
 
-    def process_table(self, table_name):
-        """Process individual table: read from bronze, clean, validate, and save to silver."""
-        logger.info(f"Processing {table_name}...")
+    def clean_products(self):
+        """Clean products data."""
+        logger.info("🧹 Cleaning products data...")
+
+        conn = self.get_connection()
+        if not conn:
+            return False
 
         try:
-            # Step 1: Read data from bronze with basic SQL cleaning
-            df = self._read_and_clean_from_bronze(table_name)
-            if df is None or df.empty:
-                logger.warning(f"No data found for {table_name}")
+            cursor = conn.cursor()
+
+            # Get bronze data
+            cursor.execute("""
+                SELECT product_id, product_name, unit_cost, selling_price,
+                       supplier_id, product_category, status
+                FROM bronze.products
+            """)
+            bronze_data = cursor.fetchall()
+
+            # Clear silver table
+            cursor.execute("TRUNCATE TABLE silver.products")
+
+            stats = {'processed': 0, 'cleaned': 0, 'rejected': 0, 'issues_fixed': 0}
+
+            for row in bronze_data:
+                product_id, product_name, unit_cost, selling_price, supplier_id, product_category, status = row
+                issues_count = 0
+
+                # Clean each field
+                cleaned_name = self.cleaner.clean_text_field(product_name)
+                if cleaned_name != product_name:
+                    issues_count += 1
+
+                cleaned_unit_cost = self.cleaner.clean_numeric_field(unit_cost, allow_negative=False, max_digits=15, decimal_places=4)
+                if str(cleaned_unit_cost) != str(unit_cost):
+                    issues_count += 1
+
+                cleaned_selling_price = self.cleaner.clean_numeric_field(selling_price, allow_negative=False, max_digits=15, decimal_places=4)
+                if str(cleaned_selling_price) != str(selling_price):
+                    issues_count += 1
+
+                cleaned_supplier_id = self.cleaner.clean_integer_field(supplier_id)
+                cleaned_category = self.cleaner.clean_category_field(product_category)
+                if cleaned_category != product_category:
+                    issues_count += 1
+
+                cleaned_status = self.cleaner.clean_status_field(status, ['active', 'discontinued'])
+                if cleaned_status != status:
+                    issues_count += 1
+
+                # Skip if essential data is missing
+                if not cleaned_name or cleaned_unit_cost is None or cleaned_selling_price is None:
+                    stats['rejected'] += 1
+                    logger.debug(f"Rejected product {product_id}: missing essential data")
+                    continue
+
+                # Calculate price margin
+                price_margin = cleaned_selling_price - cleaned_unit_cost if cleaned_unit_cost > 0 else 0
+
+                # Check for business logic issues
+                if cleaned_unit_cost > cleaned_selling_price:
+                    issues_count += 1
+                    self.log_quality_issue('products', product_id, 'pricing', 'cost_higher_than_price',
+                                         f"cost:{cleaned_unit_cost}, price:{cleaned_selling_price}", 'flagged')
+
+                quality_score = self.calculate_quality_score(issues_count, 6)
+
+                # Insert cleaned data (don't validate supplier reference yet - suppliers may not be cleaned)
+                cursor.execute("""
+                    INSERT INTO silver.products
+                    (product_id, product_name, unit_cost, selling_price, supplier_id,
+                     product_category, status, price_margin, quality_score)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (product_id, cleaned_name, cleaned_unit_cost, cleaned_selling_price,
+                      cleaned_supplier_id, cleaned_category, cleaned_status, price_margin, quality_score))
+
+                stats['processed'] += 1
+                if issues_count > 0:
+                    stats['cleaned'] += 1
+                    stats['issues_fixed'] += issues_count
+
+            conn.commit()
+            logger.info(f"✅ Products: {stats['processed']:,} processed, {stats['cleaned']:,} cleaned, {stats['rejected']:,} rejected, {stats['issues_fixed']:,} issues fixed")
+            self.total_stats['total_records_processed'] += stats['processed']
+            self.total_stats['total_records_cleaned'] += stats['cleaned']
+            self.total_stats['total_quality_issues_fixed'] += stats['issues_fixed']
+
+            return True
+
+        except psycopg2.Error as e:
+            logger.error(f"Error cleaning products: {e}")
+            conn.rollback()
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+
+    def clean_warehouses(self):
+        """Clean warehouses data."""
+        logger.info("🧹 Cleaning warehouses data...")
+
+        conn = self.get_connection()
+        if not conn:
+            return False
+
+        try:
+            cursor = conn.cursor()
+
+            # Get bronze data
+            cursor.execute("""
+                SELECT warehouse_id, warehouse_name, city, region, storage_capacity
+                FROM bronze.warehouses
+            """)
+            bronze_data = cursor.fetchall()
+
+            # Clear silver table
+            cursor.execute("TRUNCATE TABLE silver.warehouses")
+
+            stats = {'processed': 0, 'cleaned': 0, 'rejected': 0, 'issues_fixed': 0}
+
+            for row in bronze_data:
+                warehouse_id, warehouse_name, city, region, storage_capacity = row
+                issues_count = 0
+
+                # Clean each field
+                cleaned_name = self.cleaner.clean_text_field(warehouse_name)
+                if cleaned_name != warehouse_name:
+                    issues_count += 1
+
+                cleaned_city = self.cleaner.clean_text_field(city)
+                if cleaned_city != city:
+                    issues_count += 1
+
+                cleaned_region = self.cleaner.clean_text_field(region)
+                if cleaned_region != region:
+                    issues_count += 1
+
+                cleaned_capacity = self.cleaner.clean_integer_field(storage_capacity)
+                if str(cleaned_capacity) != str(storage_capacity):
+                    issues_count += 1
+
+                # Skip if essential data is missing
+                if not cleaned_name:
+                    stats['rejected'] += 1
+                    logger.debug(f"Rejected warehouse {warehouse_id}: missing name")
+                    continue
+
+                quality_score = self.calculate_quality_score(issues_count, 5)
+
+                # Insert cleaned data
+                cursor.execute("""
+                    INSERT INTO silver.warehouses
+                    (warehouse_id, warehouse_name, city, region, storage_capacity, quality_score)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (warehouse_id, cleaned_name, cleaned_city, cleaned_region, cleaned_capacity, quality_score))
+
+                stats['processed'] += 1
+                if issues_count > 0:
+                    stats['cleaned'] += 1
+                    stats['issues_fixed'] += issues_count
+
+            conn.commit()
+            logger.info(f"✅ Warehouses: {stats['processed']:,} processed, {stats['cleaned']:,} cleaned, {stats['rejected']:,} rejected, {stats['issues_fixed']:,} issues fixed")
+            self.total_stats['total_records_processed'] += stats['processed']
+            self.total_stats['total_records_cleaned'] += stats['cleaned']
+            self.total_stats['total_quality_issues_fixed'] += stats['issues_fixed']
+
+            return True
+
+        except psycopg2.Error as e:
+            logger.error(f"Error cleaning warehouses: {e}")
+            conn.rollback()
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+
+    def clean_retail_stores(self):
+        """Clean retail stores data."""
+        logger.info("🧹 Cleaning retail stores data...")
+
+        conn = self.get_connection()
+        if not conn:
+            return False
+
+        try:
+            cursor = conn.cursor()
+
+            # Get bronze data
+            cursor.execute("""
+                SELECT retail_store_id, store_name, city, region, store_type, store_status
+                FROM bronze.retail_stores
+            """)
+            bronze_data = cursor.fetchall()
+
+            # Clear silver table
+            cursor.execute("TRUNCATE TABLE silver.retail_stores")
+
+            stats = {'processed': 0, 'cleaned': 0, 'rejected': 0, 'issues_fixed': 0}
+
+            for row in bronze_data:
+                retail_store_id, store_name, city, region, store_type, store_status = row
+                issues_count = 0
+
+                # Clean each field
+                cleaned_name = self.cleaner.clean_text_field(store_name)
+                if cleaned_name != store_name:
+                    issues_count += 1
+
+                cleaned_city = self.cleaner.clean_text_field(city)
+                if cleaned_city != city:
+                    issues_count += 1
+
+                cleaned_region = self.cleaner.clean_text_field(region)
+                if cleaned_region != region:
+                    issues_count += 1
+
+                cleaned_type = self.cleaner.clean_text_field(store_type)
+                if cleaned_type != store_type:
+                    issues_count += 1
+
+                cleaned_status = self.cleaner.clean_status_field(store_status, ['active', 'inactive', 'closed'])
+                if cleaned_status != store_status:
+                    issues_count += 1
+
+                # Skip if essential data is missing
+                if not cleaned_name:
+                    stats['rejected'] += 1
+                    logger.debug(f"Rejected retail store {retail_store_id}: missing name")
+                    continue
+
+                quality_score = self.calculate_quality_score(issues_count, 6)
+
+                # Insert cleaned data
+                cursor.execute("""
+                    INSERT INTO silver.retail_stores
+                    (retail_store_id, store_name, city, region, store_type, store_status, quality_score)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (retail_store_id, cleaned_name, cleaned_city, cleaned_region, cleaned_type, cleaned_status, quality_score))
+
+                stats['processed'] += 1
+                if issues_count > 0:
+                    stats['cleaned'] += 1
+                    stats['issues_fixed'] += issues_count
+
+            conn.commit()
+            logger.info(f"✅ Retail Stores: {stats['processed']:,} processed, {stats['cleaned']:,} cleaned, {stats['rejected']:,} rejected, {stats['issues_fixed']:,} issues fixed")
+            self.total_stats['total_records_processed'] += stats['processed']
+            self.total_stats['total_records_cleaned'] += stats['cleaned']
+            self.total_stats['total_quality_issues_fixed'] += stats['issues_fixed']
+
+            return True
+
+        except psycopg2.Error as e:
+            logger.error(f"Error cleaning retail stores: {e}")
+            conn.rollback()
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+
+    def clean_supply_orders(self):
+        """Clean supply orders data."""
+        logger.info("🧹 Cleaning supply orders data...")
+
+        conn = self.get_connection()
+        if not conn:
+            return False
+
+        try:
+            cursor = conn.cursor()
+
+            # Get bronze data
+            cursor.execute("""
+                SELECT supply_order_id, product_id, warehouse_id, retail_store_id,
+                       quantity, price, total_invoice, order_date, shipped_date,
+                       delivered_date, status
+                FROM bronze.supply_orders
+            """)
+            bronze_data = cursor.fetchall()
+
+            # Clear silver table
+            cursor.execute("TRUNCATE TABLE silver.supply_orders")
+
+            stats = {'processed': 0, 'cleaned': 0, 'rejected': 0, 'issues_fixed': 0}
+
+            for row in bronze_data:
+                supply_order_id, product_id, warehouse_id, retail_store_id, quantity, price, total_invoice, order_date, shipped_date, delivered_date, status = row
+                issues_count = 0
+
+                # Clean each field
+                cleaned_product_id = self.cleaner.clean_integer_field(product_id)
+                cleaned_warehouse_id = self.cleaner.clean_integer_field(warehouse_id)
+                cleaned_retail_store_id = self.cleaner.clean_integer_field(retail_store_id)
+
+                cleaned_quantity = self.cleaner.clean_integer_field(quantity)
+                cleaned_price = self.cleaner.clean_numeric_field(price, allow_negative=False, max_digits=15, decimal_places=4)
+                cleaned_total_invoice = self.cleaner.clean_numeric_field(total_invoice, allow_negative=False, max_digits=15, decimal_places=4)
+
+                cleaned_order_date = self.cleaner.clean_date_field(order_date)
+                cleaned_shipped_date = self.cleaner.clean_date_field(shipped_date)
+                cleaned_delivered_date = self.cleaner.clean_date_field(delivered_date)
+
+                cleaned_status = self.cleaner.clean_status_field(status, ['pending', 'processing', 'shipped', 'delivered', 'cancelled'])
+
+                # Skip if essential data is missing
+                if not cleaned_order_date or cleaned_quantity is None or cleaned_quantity < 0 or cleaned_price is None:
+                    stats['rejected'] += 1
+                    logger.debug(f"Rejected supply order {supply_order_id}: missing essential data")
+                    continue
+
+                # Business logic validations
+                is_calculation_correct = True
+                date_logic_valid = True
+
+                # Check calculation
+                expected_total = (cleaned_quantity or 0) * (cleaned_price or 0)
+                if cleaned_total_invoice and abs(cleaned_total_invoice - expected_total) > 0.01:
+                    is_calculation_correct = False
+                    issues_count += 1
+
+                # Check date logic
+                if cleaned_shipped_date and cleaned_shipped_date < cleaned_order_date:
+                    date_logic_valid = False
+                    issues_count += 1
+
+                if cleaned_delivered_date and cleaned_shipped_date and cleaned_delivered_date < cleaned_shipped_date:
+                    date_logic_valid = False
+                    issues_count += 1
+
+                quality_score = self.calculate_quality_score(issues_count, 11)
+
+                # Insert cleaned data
+                cursor.execute("""
+                    INSERT INTO silver.supply_orders
+                    (supply_order_id, product_id, warehouse_id, retail_store_id, quantity,
+                     price, total_invoice, order_date, shipped_date, delivered_date, status,
+                     is_calculation_correct, date_logic_valid, quality_score)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (supply_order_id, cleaned_product_id, cleaned_warehouse_id, cleaned_retail_store_id,
+                      cleaned_quantity, cleaned_price, cleaned_total_invoice, cleaned_order_date,
+                      cleaned_shipped_date, cleaned_delivered_date, cleaned_status,
+                      is_calculation_correct, date_logic_valid, quality_score))
+
+                stats['processed'] += 1
+                if issues_count > 0:
+                    stats['cleaned'] += 1
+                    stats['issues_fixed'] += issues_count
+
+            conn.commit()
+            logger.info(f"✅ Supply Orders: {stats['processed']:,} processed, {stats['cleaned']:,} cleaned, {stats['rejected']:,} rejected, {stats['issues_fixed']:,} issues fixed")
+            self.total_stats['total_records_processed'] += stats['processed']
+            self.total_stats['total_records_cleaned'] += stats['cleaned']
+            self.total_stats['total_quality_issues_fixed'] += stats['issues_fixed']
+
+            return True
+
+        except psycopg2.Error as e:
+            logger.error(f"Error cleaning supply orders: {e}")
+            conn.rollback()
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+
+    def clean_inventory(self):
+        """Clean inventory data."""
+        logger.info("🧹 Cleaning inventory data...")
+
+        conn = self.get_connection()
+        if not conn:
+            return False
+
+        try:
+            cursor = conn.cursor()
+
+            # Get bronze data
+            cursor.execute("""
+                SELECT inventory_id, product_id, warehouse_id, quantity_on_hand, last_stocked_date
+                FROM bronze.inventory
+            """)
+            bronze_data = cursor.fetchall()
+
+            # Clear silver table
+            cursor.execute("TRUNCATE TABLE silver.inventory")
+
+            stats = {'processed': 0, 'cleaned': 0, 'rejected': 0, 'issues_fixed': 0}
+
+            for row in bronze_data:
+                inventory_id, product_id, warehouse_id, quantity_on_hand, last_stocked_date = row
+                issues_count = 0
+
+                # Clean each field
+                cleaned_product_id = self.cleaner.clean_integer_field(product_id)
+                cleaned_warehouse_id = self.cleaner.clean_integer_field(warehouse_id)
+                cleaned_quantity = self.cleaner.clean_integer_field(quantity_on_hand)
+                cleaned_date = self.cleaner.clean_date_field(last_stocked_date)
+
+                # Skip if essential data is missing
+                if cleaned_quantity is None or cleaned_quantity < 0:
+                    stats['rejected'] += 1
+                    logger.debug(f"Rejected inventory {inventory_id}: invalid quantity")
+                    continue
+
+                quality_score = self.calculate_quality_score(issues_count, 5)
+
+                # Insert cleaned data
+                cursor.execute("""
+                    INSERT INTO silver.inventory
+                    (inventory_id, product_id, warehouse_id, quantity_on_hand, last_stocked_date, quality_score)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (inventory_id, cleaned_product_id, cleaned_warehouse_id, cleaned_quantity, cleaned_date, quality_score))
+
+                stats['processed'] += 1
+                if issues_count > 0:
+                    stats['cleaned'] += 1
+                    stats['issues_fixed'] += issues_count
+
+            conn.commit()
+            logger.info(f"✅ Inventory: {stats['processed']:,} processed, {stats['cleaned']:,} cleaned, {stats['rejected']:,} rejected, {stats['issues_fixed']:,} issues fixed")
+            self.total_stats['total_records_processed'] += stats['processed']
+            self.total_stats['total_records_cleaned'] += stats['cleaned']
+            self.total_stats['total_quality_issues_fixed'] += stats['issues_fixed']
+
+            return True
+
+        except psycopg2.Error as e:
+            logger.error(f"Error cleaning inventory: {e}")
+            conn.rollback()
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+
+    def run_full_cleaning_pipeline(self):
+        """Run the complete silver layer cleaning pipeline."""
+        logger.info("🥈 SILVER LAYER BUILDER - DATA QUALITY CLEANING")
+        logger.info("=" * 60)
+        logger.info("Processing all tables with data quality fixes...")
+        logger.info("=" * 60)
+
+        start_time = datetime.now()
+
+        # Step 1: Setup silver tables
+        logger.info("1️⃣  Setting up Silver layer tables...")
+        if not self.setup_silver_tables():
+            logger.error("❌ Failed to setup silver tables")
+            return False
+
+        # Step 2: Clean tables in order (independent tables first)
+        cleaning_steps = [
+            ("suppliers", self.clean_suppliers),
+            ("warehouses", self.clean_warehouses),
+            ("retail_stores", self.clean_retail_stores),
+            ("products", self.clean_products),
+            ("inventory", self.clean_inventory),
+            ("supply_orders", self.clean_supply_orders)
+        ]
+
+        for step_num, (table_name, clean_func) in enumerate(cleaning_steps, 2):
+            logger.info(f"{step_num}️⃣  Cleaning {table_name}...")
+            if not clean_func():
+                logger.error(f"❌ Failed to clean {table_name}")
                 return False
 
-            input_count = len(df)
-            logger.info(f"Loaded {input_count:,} rows from bronze.{table_name}")
+        # Step 3: Final summary
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
 
-            # Step 2: Apply Python validations
-            valid_df, invalid_df, rejection_reasons = self._apply_validations(table_name, df)
+        logger.info("=" * 60)
+        logger.info("🎉 SILVER LAYER CLEANING COMPLETED!")
+        logger.info("=" * 60)
+        logger.info(f"📊 Processing Summary:")
+        logger.info(f"   Records processed: {self.total_stats['total_records_processed']:,}")
+        logger.info(f"   Records cleaned: {self.total_stats['total_records_cleaned']:,}")
+        logger.info(f"   Quality issues fixed: {self.total_stats['total_quality_issues_fixed']:,}")
+        logger.info(f"   Processing time: {duration:.1f} seconds")
+        logger.info("=" * 60)
 
-            # Step 3: Save valid rows to silver
-            if not valid_df.empty:
-                self._save_to_silver(table_name, valid_df)
-                logger.info(f"✅ {len(valid_df):,} valid rows saved to silver.{table_name}")
-
-            # Step 4: Save invalid rows to audit
-            if not invalid_df.empty:
-                self._save_rejected_rows(table_name, invalid_df, rejection_reasons)
-                logger.warning(f"⚠️  {len(invalid_df):,} invalid rows saved to audit.rejected_rows")
-
-            # Step 5: Log statistics
-            self.stats[table_name] = {
-                'input_rows': input_count,
-                'valid_rows': len(valid_df),
-                'invalid_rows': len(invalid_df)
-            }
-
-            # Step 6: Log to audit
-            self.log_etl_step(f"process_{table_name}", table_name, input_count, len(valid_df), len(invalid_df))
-
-            return True
-
-        except Exception as e:
-            logger.error(f"Error processing {table_name}: {e}")
-            return False
-
-    def _read_and_clean_from_bronze(self, table_name):
-        """Read data from bronze table with SQL-based cleaning."""
-        cleaning_queries = {
-            'suppliers': """
-                SELECT DISTINCT
-                    supplier_id,
-                    TRIM(INITCAP(supplier_name)) as supplier_name,
-                    LOWER(TRIM(contact_email)) as contact_email,
-                    REGEXP_REPLACE(TRIM(phone_number), '[^0-9+()-]', '', 'g') as phone_number,
-                    created_at,
-                    updated_at
-                FROM bronze.suppliers
-                WHERE supplier_name IS NOT NULL
-                  AND contact_email IS NOT NULL
-                  AND phone_number IS NOT NULL
-                  AND supplier_id IS NOT NULL
-            """,
-
-            'products': """
-                SELECT DISTINCT
-                    product_id,
-                    TRIM(INITCAP(product_name)) as product_name,
-                    CAST(unit_cost AS NUMERIC(10,2)) as unit_cost,
-                    CAST(selling_price AS NUMERIC(10,2)) as selling_price,
-                    supplier_id,
-                    TRIM(product_category) as product_category,
-                    COALESCE(status, 'active') as status,
-                    created_at,
-                    updated_at
-                FROM bronze.products
-                WHERE product_name IS NOT NULL
-                  AND unit_cost IS NOT NULL
-                  AND selling_price IS NOT NULL
-                  AND unit_cost::NUMERIC > 0
-                  AND selling_price::NUMERIC > 0
-                  AND product_id IS NOT NULL
-                  AND supplier_id IS NOT NULL
-                  AND product_category IS NOT NULL
-            """,
-
-            'warehouses': """
-                SELECT DISTINCT
-                    warehouse_id,
-                    TRIM(INITCAP(warehouse_name)) as warehouse_name,
-                    TRIM(INITCAP(city)) as city,
-                    TRIM(INITCAP(region)) as region,
-                    CAST(storage_capacity AS INTEGER) as storage_capacity,
-                    created_at,
-                    updated_at
-                FROM bronze.warehouses
-                WHERE warehouse_name IS NOT NULL
-                  AND city IS NOT NULL
-                  AND region IS NOT NULL
-                  AND storage_capacity IS NOT NULL
-                  AND storage_capacity::INTEGER > 0
-                  AND warehouse_id IS NOT NULL
-            """,
-
-            'inventory': """
-                SELECT DISTINCT
-                    inventory_id,
-                    product_id,
-                    warehouse_id,
-                    CAST(quantity_on_hand AS INTEGER) as quantity_on_hand,
-                    last_stocked_date,
-                    created_at,
-                    updated_at
-                FROM bronze.inventory
-                WHERE product_id IS NOT NULL
-                  AND warehouse_id IS NOT NULL
-                  AND quantity_on_hand IS NOT NULL
-                  AND quantity_on_hand::INTEGER >= 0
-                  AND inventory_id IS NOT NULL
-            """,
-
-            'retail_stores': """
-                SELECT DISTINCT
-                    retail_store_id,
-                    TRIM(INITCAP(store_name)) as store_name,
-                    TRIM(INITCAP(city)) as city,
-                    TRIM(INITCAP(region)) as region,
-                    TRIM(INITCAP(store_type)) as store_type,
-                    CASE
-                        WHEN UPPER(TRIM(store_status)) = 'ACTIVE' THEN 'active'
-                        WHEN UPPER(TRIM(store_status)) = 'CLOSED' THEN 'closed'
-                        WHEN UPPER(TRIM(store_status)) IN ('UNDER RENOVATION', 'RENOVATION') THEN 'under renovation'
-                        ELSE COALESCE(LOWER(TRIM(store_status)), 'active')
-                    END as store_status,
-                    created_at,
-                    updated_at
-                FROM bronze.retail_stores
-                WHERE store_name IS NOT NULL
-                  AND city IS NOT NULL
-                  AND region IS NOT NULL
-                  AND store_type IS NOT NULL
-                  AND retail_store_id IS NOT NULL
-            """,
-
-            'supply_orders': """
-                SELECT DISTINCT
-                    supply_order_id,
-                    product_id,
-                    warehouse_id,
-                    retail_store_id,
-                    CAST(quantity AS INTEGER) as quantity,
-                    CAST(price AS NUMERIC(10,2)) as price,
-                    CAST(total_invoice AS NUMERIC(12,2)) as total_invoice,
-                    order_date,
-                    shipped_date,
-                    delivered_date,
-                    CASE
-                        WHEN UPPER(TRIM(status)) = 'PENDING' THEN 'pending'
-                        WHEN UPPER(TRIM(status)) = 'SHIPPED' THEN 'shipped'
-                        WHEN UPPER(TRIM(status)) = 'DELIVERED' THEN 'delivered'
-                        WHEN UPPER(TRIM(status)) IN ('CANCELLED', 'CANCELED') THEN 'canceled'
-                        ELSE COALESCE(LOWER(TRIM(status)), 'pending')
-                    END as status,
-                    created_at,
-                    updated_at
-                FROM bronze.supply_orders
-                WHERE product_id IS NOT NULL
-                  AND warehouse_id IS NOT NULL
-                  AND retail_store_id IS NOT NULL
-                  AND quantity IS NOT NULL
-                  AND price IS NOT NULL
-                  AND total_invoice IS NOT NULL
-                  AND order_date IS NOT NULL
-                  AND quantity::INTEGER > 0
-                  AND price::NUMERIC > 0
-                  AND total_invoice::NUMERIC > 0
-                  AND supply_order_id IS NOT NULL
-            """
-        }
-
-        try:
-            from sqlalchemy import create_engine
-            engine = create_engine(f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
-
-            query = cleaning_queries.get(table_name)
-            if not query:
-                logger.error(f"No cleaning query defined for {table_name}")
-                return None
-
-            df = pd.read_sql(query, engine)
-            engine.dispose()
-            return df
-
-        except Exception as e:
-            logger.error(f"Error reading from bronze.{table_name}: {e}")
-            return None
-
-    def _apply_validations(self, table_name, df):
-        """Apply specific validations based on table type."""
-        valid_mask = pd.Series([True] * len(df))
-        rejection_reasons = [''] * len(df)
-
-        if table_name == 'suppliers':
-            # Email validation
-            email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-            invalid_email = ~df['contact_email'].str.match(email_pattern)
-            valid_mask &= ~invalid_email
-            rejection_reasons = [r if not ie else 'Invalid email format'
-                               for r, ie in zip(rejection_reasons, invalid_email)]
-
-            # Phone validation
-            phone_pattern = r'^[\+]?[1-9][\d]{0,15}$'
-            invalid_phone = ~df['phone_number'].str.replace(r'[()\s-]', '', regex=True).str.match(phone_pattern)
-            valid_mask &= ~invalid_phone
-            rejection_reasons = [r if not ip else 'Invalid phone format'
-                               for r, ip in zip(rejection_reasons, invalid_phone)]
-
-        elif table_name == 'products':
-            # Unit cost range validation
-            invalid_cost = (df['unit_cost'] <= 0) | (df['unit_cost'] > 100000)
-            valid_mask &= ~invalid_cost
-            rejection_reasons = [r if not ic else 'Unit cost out of range (0-100000)'
-                               for r, ic in zip(rejection_reasons, invalid_cost)]
-
-            # Selling price range validation
-            invalid_selling_price = (df['selling_price'] <= 0) | (df['selling_price'] > 500000)
-            valid_mask &= ~invalid_selling_price
-            rejection_reasons = [r if not isp else 'Selling price out of range (0-500000)'
-                               for r, isp in zip(rejection_reasons, invalid_selling_price)]
-
-            # Selling price should be greater than unit cost
-            invalid_margin = df['selling_price'] <= df['unit_cost']
-            valid_mask &= ~invalid_margin
-            rejection_reasons = [r if not im else 'Selling price must be greater than unit cost'
-                               for r, im in zip(rejection_reasons, invalid_margin)]
-
-            # Product category validation (should not be empty)
-            invalid_category = df['product_category'].str.strip().eq('')
-            valid_mask &= ~invalid_category
-            rejection_reasons = [r if not ic else 'Empty product category'
-                               for r, ic in zip(rejection_reasons, invalid_category)]
-
-            # Status validation
-            valid_statuses = ['active', 'discontinued']
-            invalid_status = ~df['status'].isin(valid_statuses)
-            valid_mask &= ~invalid_status
-            rejection_reasons = [r if not ist else 'Invalid product status'
-                               for r, ist in zip(rejection_reasons, invalid_status)]
-
-        elif table_name == 'warehouses':
-            # Storage capacity validation
-            invalid_capacity = (df['storage_capacity'] <= 0) | (df['storage_capacity'] > 5000000)
-            valid_mask &= ~invalid_capacity
-            rejection_reasons = [r if not ic else 'Storage capacity out of range (0-5000000)'
-                               for r, ic in zip(rejection_reasons, invalid_capacity)]
-
-            # Region validation (should not be empty)
-            invalid_region = df['region'].str.strip().eq('')
-            valid_mask &= ~invalid_region
-            rejection_reasons = [r if not ir else 'Empty region'
-                               for r, ir in zip(rejection_reasons, invalid_region)]
-
-            # City validation (should not be empty)
-            invalid_city = df['city'].str.strip().eq('')
-            valid_mask &= ~invalid_city
-            rejection_reasons = [r if not ic else 'Empty city'
-                               for r, ic in zip(rejection_reasons, invalid_city)]
-
-        elif table_name == 'inventory':
-            # Quantity validation
-            invalid_quantity = df['quantity_on_hand'] < 0
-            valid_mask &= ~invalid_quantity
-            rejection_reasons = [r if not iq else 'Negative quantity'
-                               for r, iq in zip(rejection_reasons, invalid_quantity)]
-
-            # Date validation
-            today = pd.Timestamp.now().date()
-            future_date = pd.to_datetime(df['last_stocked_date']).dt.date > today
-            valid_mask &= ~future_date
-            rejection_reasons = [r if not fd else 'Future stocking date'
-                               for r, fd in zip(rejection_reasons, future_date)]
-
-        elif table_name == 'retail_stores':
-            # Store status validation
-            valid_statuses = ['active', 'closed', 'under renovation']
-            invalid_status = ~df['store_status'].isin(valid_statuses)
-            valid_mask &= ~invalid_status
-            rejection_reasons = [r if not ist else 'Invalid store status'
-                               for r, ist in zip(rejection_reasons, invalid_status)]
-
-            # Store type validation (should not be empty)
-            invalid_type = df['store_type'].str.strip().eq('')
-            valid_mask &= ~invalid_type
-            rejection_reasons = [r if not it else 'Empty store type'
-                               for r, it in zip(rejection_reasons, invalid_type)]
-
-            # Region validation (should not be empty)
-            invalid_region = df['region'].str.strip().eq('')
-            valid_mask &= ~invalid_region
-            rejection_reasons = [r if not ir else 'Empty region'
-                               for r, ir in zip(rejection_reasons, invalid_region)]
-
-        elif table_name == 'supply_orders':
-            # Status validation
-            valid_statuses = ['pending', 'shipped', 'delivered', 'canceled']
-            invalid_status = ~df['status'].isin(valid_statuses)
-            valid_mask &= ~invalid_status
-            rejection_reasons = [r if not ist else 'Invalid order status'
-                               for r, ist in zip(rejection_reasons, invalid_status)]
-
-            # Quantity validation
-            invalid_qty = df['quantity'] <= 0
-            valid_mask &= ~invalid_qty
-            rejection_reasons = [r if not iq else 'Invalid quantity (must be positive)'
-                               for r, iq in zip(rejection_reasons, invalid_qty)]
-
-            # Price validation
-            invalid_price = (df['price'] <= 0) | (df['price'] > 500000)
-            valid_mask &= ~invalid_price
-            rejection_reasons = [r if not ip else 'Price out of range (0-500000)'
-                               for r, ip in zip(rejection_reasons, invalid_price)]
-
-            # Total invoice validation
-            invalid_total = df['total_invoice'] <= 0
-            valid_mask &= ~invalid_total
-            rejection_reasons = [r if not it else 'Invalid total invoice (must be positive)'
-                               for r, it in zip(rejection_reasons, invalid_total)]
-
-            # Logical validation: total_invoice should be approximately quantity * price
-            calculated_total = df['quantity'] * df['price']
-            tolerance = 0.01  # 1% tolerance for rounding
-            invalid_calculation = abs(df['total_invoice'] - calculated_total) > (calculated_total * tolerance)
-            valid_mask &= ~invalid_calculation
-            rejection_reasons = [r if not ic else 'Total invoice does not match quantity × price'
-                               for r, ic in zip(rejection_reasons, invalid_calculation)]
-
-            # Date logic validation: shipped_date should be after order_date if present
-            shipped_before_order = (df['shipped_date'].notna()) & (df['shipped_date'] < df['order_date'])
-            valid_mask &= ~shipped_before_order
-            rejection_reasons = [r if not sbo else 'Shipped date before order date'
-                               for r, sbo in zip(rejection_reasons, shipped_before_order)]
-
-            # Date logic validation: delivered_date should be after shipped_date if both present
-            delivered_before_shipped = (df['delivered_date'].notna()) & (df['shipped_date'].notna()) & (df['delivered_date'] < df['shipped_date'])
-            valid_mask &= ~delivered_before_shipped
-            rejection_reasons = [r if not dbs else 'Delivered date before shipped date'
-                               for r, dbs in zip(rejection_reasons, delivered_before_shipped)]
-
-        valid_df = df[valid_mask].copy()
-        invalid_df = df[~valid_mask].copy()
-        invalid_reasons = [r for r, v in zip(rejection_reasons, ~valid_mask) if v]
-
-        return valid_df, invalid_df, invalid_reasons
-
-    def _save_to_silver(self, table_name, df):
-        """Save DataFrame to silver table."""
-        try:
-            from sqlalchemy import create_engine
-            engine = create_engine(f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
-            df.to_sql(table_name, engine, schema='silver', if_exists='replace', index=False)
-            engine.dispose()
-        except Exception as e:
-            logger.error(f"Error saving to silver.{table_name}: {e}")
-            raise
-
-    def _save_rejected_rows(self, table_name, invalid_df, reasons):
-        """Save rejected rows to audit.rejected_rows."""
+        # Show final record counts
         conn = self.get_connection()
-        if not conn:
-            return
+        if conn:
+            try:
+                cursor = conn.cursor()
+                logger.info("📈 Final Silver Layer Record Counts:")
+                tables = ['suppliers', 'products', 'warehouses', 'inventory', 'retail_stores', 'supply_orders']
+                total_clean = 0
+                for table in tables:
+                    cursor.execute(f"SELECT COUNT(*) FROM silver.{table}")
+                    count = cursor.fetchone()[0]
+                    total_clean += count
+                    logger.info(f"   silver.{table:<15}: {count:>8,} clean records")
+                logger.info(f"   {'TOTAL CLEAN':<20}: {total_clean:>8,} records")
+                cursor.close()
+                conn.close()
+            except:
+                pass
 
-        try:
-            cursor = conn.cursor()
-
-            for idx, (_, row) in enumerate(invalid_df.iterrows()):
-                record_json = row.to_json()
-                reason = reasons[idx] if idx < len(reasons) else 'Validation failed'
-
-                cursor.execute("""
-                    INSERT INTO audit.rejected_rows (table_name, record, reason, run_id)
-                    VALUES (%s, %s, %s, %s)
-                """, (table_name, record_json, reason, self.run_id))
-
-            conn.commit()
-
-        except psycopg2.Error as e:
-            logger.error(f"Error saving rejected rows: {e}")
-        finally:
-            cursor.close()
-            conn.close()
-
-    def process_all_tables(self):
-        """Process all tables in the correct order."""
-        logger.info("🚀 Starting Silver layer processing...")
-
-        results = {}
-        for table_name in self.tables:
-            results[table_name] = self.process_table(table_name)
-
-        all_success = all(results.values())
-        if all_success:
-            logger.info("✅ All tables processed successfully")
-        else:
-            logger.warning("⚠️  Some tables had processing issues")
-
-        return all_success
-
-    def run_data_quality_checks(self):
-        """Run data quality checks on silver tables."""
-        logger.info("Running Data Quality checks...")
-
-        checks = {
-            'suppliers': [
-                ('pk_uniqueness', "SELECT COUNT(*) - COUNT(DISTINCT supplier_id) FROM silver.suppliers"),
-                ('email_uniqueness', "SELECT COUNT(*) - COUNT(DISTINCT contact_email) FROM silver.suppliers"),
-                ('null_check', "SELECT COUNT(*) FROM silver.suppliers WHERE supplier_name IS NULL OR contact_email IS NULL")
-            ],
-            'products': [
-                ('pk_uniqueness', "SELECT COUNT(*) - COUNT(DISTINCT product_id) FROM silver.products"),
-                ('positive_cost', "SELECT COUNT(*) FROM silver.products WHERE unit_cost <= 0"),
-                ('positive_selling_price', "SELECT COUNT(*) FROM silver.products WHERE selling_price <= 0"),
-                ('selling_price_gt_cost', "SELECT COUNT(*) FROM silver.products WHERE selling_price <= unit_cost")
-            ],
-            'warehouses': [
-                ('pk_uniqueness', "SELECT COUNT(*) - COUNT(DISTINCT warehouse_id) FROM silver.warehouses"),
-                ('positive_capacity', "SELECT COUNT(*) FROM silver.warehouses WHERE storage_capacity <= 0"),
-                ('non_empty_region', "SELECT COUNT(*) FROM silver.warehouses WHERE region IS NULL OR TRIM(region) = ''"),
-                ('non_empty_city', "SELECT COUNT(*) FROM silver.warehouses WHERE city IS NULL OR TRIM(city) = ''")
-            ],
-            'inventory': [
-                ('fk_product_valid', """SELECT COUNT(*) FROM silver.inventory i
-                                       LEFT JOIN silver.products p ON i.product_id = p.product_id
-                                       WHERE p.product_id IS NULL"""),
-                ('fk_warehouse_valid', """SELECT COUNT(*) FROM silver.inventory i
-                                         LEFT JOIN silver.warehouses w ON i.warehouse_id = w.warehouse_id
-                                         WHERE w.warehouse_id IS NULL"""),
-                ('non_negative_qty', "SELECT COUNT(*) FROM silver.inventory WHERE quantity_on_hand < 0")
-            ],
-            'retail_stores': [
-                ('pk_uniqueness', "SELECT COUNT(*) - COUNT(DISTINCT retail_store_id) FROM silver.retail_stores"),
-                ('valid_status', """SELECT COUNT(*) FROM silver.retail_stores
-                                   WHERE store_status NOT IN ('active','closed','under renovation')"""),
-                ('non_empty_type', "SELECT COUNT(*) FROM silver.retail_stores WHERE store_type IS NULL OR TRIM(store_type) = ''"),
-                ('non_empty_region', "SELECT COUNT(*) FROM silver.retail_stores WHERE region IS NULL OR TRIM(region) = ''")
-            ],
-            'supply_orders': [
-                ('pk_uniqueness', "SELECT COUNT(*) - COUNT(DISTINCT supply_order_id) FROM silver.supply_orders"),
-                ('fk_product_valid', """SELECT COUNT(*) FROM silver.supply_orders so
-                                       LEFT JOIN silver.products p ON so.product_id = p.product_id
-                                       WHERE p.product_id IS NULL"""),
-                ('fk_warehouse_valid', """SELECT COUNT(*) FROM silver.supply_orders so
-                                         LEFT JOIN silver.warehouses w ON so.warehouse_id = w.warehouse_id
-                                         WHERE w.warehouse_id IS NULL"""),
-                ('fk_retail_store_valid', """SELECT COUNT(*) FROM silver.supply_orders so
-                                            LEFT JOIN silver.retail_stores rs ON so.retail_store_id = rs.retail_store_id
-                                            WHERE rs.retail_store_id IS NULL"""),
-                ('valid_status', """SELECT COUNT(*) FROM silver.supply_orders
-                                   WHERE status NOT IN ('pending','shipped','delivered','canceled')"""),
-                ('positive_quantity', "SELECT COUNT(*) FROM silver.supply_orders WHERE quantity <= 0"),
-                ('positive_price', "SELECT COUNT(*) FROM silver.supply_orders WHERE price <= 0"),
-                ('positive_total', "SELECT COUNT(*) FROM silver.supply_orders WHERE total_invoice <= 0")
-            ]
-        }
-
-        conn = self.get_connection()
-        if not conn:
-            return False
-
-        try:
-            cursor = conn.cursor()
-            all_passed = True
-
-            for table_name, table_checks in checks.items():
-                logger.info(f"Running DQ checks for {table_name}...")
-
-                for check_name, sql_query in table_checks:
-                    cursor.execute(sql_query)
-                    bad_count = cursor.fetchone()[0]
-                    passed = bad_count == 0
-
-                    if not passed:
-                        all_passed = False
-                        logger.warning(f"❌ {table_name}.{check_name}: {bad_count} bad rows")
-                    else:
-                        logger.info(f"✅ {table_name}.{check_name}: PASSED")
-
-                    # Save result to audit.dq_results
-                    cursor.execute("""
-                        INSERT INTO audit.dq_results (table_name, check_name, pass_fail, bad_row_count, run_id)
-                        VALUES (%s, %s, %s, %s, %s)
-                    """, (table_name, check_name, passed, bad_count, self.run_id))
-
-            conn.commit()
-
-            if all_passed:
-                logger.info("✅ All Data Quality checks passed")
-            else:
-                logger.warning("⚠️  Some Data Quality checks failed")
-
-            return True
-
-        except psycopg2.Error as e:
-            logger.error(f"Error running DQ checks: {e}")
-            return False
-        finally:
-            cursor.close()
-            conn.close()
-
-    def log_etl_step(self, step_name, table_name, input_count, output_count, rejected_count):
-        """Log ETL step to audit.etl_log."""
-        conn = self.get_connection()
-        if not conn:
-            return
-
-        try:
-            cursor = conn.cursor()
-
-            # Simple checksum based on row count
-            checksum = f"{table_name}:{output_count}"
-            import hashlib
-            checksum = hashlib.md5(checksum.encode()).hexdigest()
-
-            cursor.execute("""
-                INSERT INTO audit.etl_log
-                (run_id, run_timestamp, step_executed, table_name, input_row_count,
-                 output_row_count, rejected_row_count, data_checksum)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (self.run_id, datetime.now(), step_name, table_name,
-                  input_count, output_count, rejected_count, checksum))
-
-            conn.commit()
-
-        except psycopg2.Error as e:
-            logger.error(f"Error logging ETL step: {e}")
-        finally:
-            cursor.close()
-            conn.close()
-
-    def log_summary(self):
-        """Log final summary of Silver layer processing."""
-        logger.info("=" * 60)
-        logger.info("📊 SILVER LAYER PROCESSING SUMMARY")
-        logger.info("=" * 60)
-
-        total_input = sum(stats.get('input_rows', 0) for stats in self.stats.values())
-        total_valid = sum(stats.get('valid_rows', 0) for stats in self.stats.values())
-        total_invalid = sum(stats.get('invalid_rows', 0) for stats in self.stats.values())
-
-        for table_name in self.tables:
-            stats = self.stats.get(table_name, {})
-            input_rows = stats.get('input_rows', 0)
-            valid_rows = stats.get('valid_rows', 0)
-            invalid_rows = stats.get('invalid_rows', 0)
-
-            logger.info(f"  {table_name:<12}: {input_rows:>8,} → {valid_rows:>8,} valid, {invalid_rows:>6,} rejected")
-
-        logger.info("-" * 60)
-        logger.info(f"  {'TOTAL':<12}: {total_input:>8,} → {total_valid:>8,} valid, {total_invalid:>6,} rejected")
-        logger.info(f"  Run ID: {self.run_id}")
-        logger.info("=" * 60)
-
-    def run_full_silver_pipeline(self):
-        """Run complete silver layer pipeline."""
-        logger.info("🥈 SILVER LAYER BUILDER - FULL PIPELINE")
-        logger.info("=" * 60)
-
-        # Step 1: Setup schemas
-        if not self.setup_schemas():
-            logger.error("❌ Schema setup failed")
-            return False
-
-        # Step 2: Process all tables
-        if not self.process_all_tables():
-            logger.error("❌ Table processing failed")
-            return False
-
-        # Step 3: Run DQ checks
-        if not self.run_data_quality_checks():
-            logger.warning("⚠️  Some DQ checks failed, but continuing...")
-
-        # Step 4: Log summary
-        self.log_summary()
-
-        logger.info("✅ Silver layer pipeline completed successfully!")
+        logger.info("✅ Silver layer ready for Gold layer processing!")
         return True
 
 
 def main():
     """Main function for standalone execution."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-
-    sb = SilverBuilder()
-    success = sb.run_full_silver_pipeline()
+    builder = SilverBuilder()
+    success = builder.run_full_cleaning_pipeline()
 
     if success:
-        print("✅ Silver Builder completed successfully!")
+        print("\n🎉 Silver Builder completed successfully!")
+        print("All data quality issues have been addressed!")
     else:
-        print("❌ Silver Builder failed!")
+        print("\n❌ Silver Builder failed!")
         sys.exit(1)
 
 

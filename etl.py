@@ -56,7 +56,7 @@ def build_silver():
 
     try:
         silver_builder = SilverBuilder()
-        return silver_builder.run_full_silver_pipeline()
+        return silver_builder.run_full_cleaning_pipeline()
 
     except Exception as e:
         logger.error(f"❌ Error building Silver layer: {e}")
