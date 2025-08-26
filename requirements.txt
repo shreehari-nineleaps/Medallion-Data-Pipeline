@@ -46,3 +46,8 @@ tzdata==2025.2
 uritemplate==4.2.0
 urllib3==2.5.0
 python-dotenv==1.0.0
+
+# Advanced Forecasting Dependencies
+prophet==1.1.4
+statsmodels==0.14.1
+scikit-learn==1.3.2

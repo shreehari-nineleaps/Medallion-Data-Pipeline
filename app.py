@@ -170,6 +170,7 @@ pages = {
     "⚙️ Pipeline Control": "pipeline",
     "🗄️ Database Explorer": "database",
     "📊 Data Analytics": "analytics",
+    "🔮 Forecasting": "forecasting",
     "💻 Query Runner": "query",
     "📈 BI Dashboard": "dashboard"
 }
@@ -735,7 +736,108 @@ WHERE i.stock_quantity <= i.reorder_level;"""
         st.markdown("- inventory_id, product_id, warehouse_name")
         st.markdown("- stock_quantity, reorder_level")
 
-# BI DASHBOARD PAGE
+elif current_page == "forecasting":
+    st.header("🔮 Demand Forecasting")
+
+    conn = get_database_connection()
+    if not conn:
+        st.error("❌ Cannot connect to database.")
+        st.stop()
+
+    st.markdown("""
+    ### 🎯 Flexible Forecasting
+    Use filters below to generate and view demand forecasts:
+    - **Product Level** → product_id based forecast  
+    - **Warehouse Level** → warehouse_id based forecast  
+    - **Duration** → select forecast horizon  
+    """)
+
+    st.markdown("---")
+
+    # 🔹 Fetch filter values safely
+    try:
+        product_ids = execute_query("SELECT DISTINCT product_id FROM silver.supply_orders ORDER BY product_id LIMIT 200")
+    except Exception:
+        product_ids = pd.DataFrame(columns=["product_id"])
+
+    try:
+        warehouse_ids = execute_query("SELECT DISTINCT warehouse_id FROM silver.supply_orders ORDER BY warehouse_id LIMIT 200")
+    except Exception:
+        warehouse_ids = pd.DataFrame(columns=["warehouse_id"])
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        selected_product = st.selectbox(
+            "📦 Product ID",
+            ["All"] + product_ids['product_id'].astype(str).tolist() if not product_ids.empty else ["All"]
+        )
+
+    with col2:
+        selected_warehouse = st.selectbox(
+            "🏪 Warehouse ID",
+            ["All"] + warehouse_ids['warehouse_id'].astype(str).tolist() if not warehouse_ids.empty else ["All"]
+        )
+
+    with col3:
+        duration = st.selectbox("📅 Duration", ["4 weeks", "8 weeks", "12 weeks", "6 months", "12 months"])
+
+    st.markdown("---")
+
+    # 🔹 Button to trigger simple_forecasting.py
+    if st.button("🚀 Run Forecasting", type="primary", use_container_width=True):
+        with st.spinner("Running forecasting pipeline... ⏳"):
+            try:
+                import subprocess, sys
+                result = subprocess.run(
+                    [sys.executable, "simple_forecasting.py"],
+                    capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    st.success("🎉 Forecasting pipeline completed successfully!")
+                else:
+                    st.error("❌ Forecasting pipeline failed.")
+                    st.code(result.stderr)
+            except Exception as e:
+                st.error(f"❌ Error running forecasting: {str(e)}")
+                st.exception(e)
+
+    st.markdown("---")
+
+    # 🔹 Show Forecast Results
+    st.subheader("📊 Forecast Results")
+
+    forecast_query = """
+        SELECT ds, yhat, yhat_lower, yhat_upper, level, entity_id, model, granularity
+        FROM gold.forecasts
+        WHERE ds >= CURRENT_DATE
+    """
+
+    if selected_product != "All":
+        forecast_query += f" AND level = 'product' AND entity_id = '{selected_product}'"
+    if selected_warehouse != "All":
+        forecast_query += f" AND level = 'warehouse' AND entity_id = '{selected_warehouse}'"
+
+    forecast_query += " ORDER BY ds ASC LIMIT 200"
+
+    df_forecasts = execute_query(forecast_query)
+
+    if df_forecasts is not None and not df_forecasts.empty:
+        st.dataframe(df_forecasts, use_container_width=True)
+
+        import plotly.express as px
+        fig = px.line(df_forecasts, x="ds", y="yhat",
+                      title="📈 Forecasted Demand",
+                      markers=True)
+        fig.add_scatter(x=df_forecasts["ds"], y=df_forecasts["yhat_lower"],
+                        mode="lines", name="Lower Bound", line=dict(dash="dot"))
+        fig.add_scatter(x=df_forecasts["ds"], y=df_forecasts["yhat_upper"],
+                        mode="lines", name="Upper Bound", line=dict(dash="dot"))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("ℹ️ No forecasts found for the selected filters. Try running the pipeline again.")
+
+
 elif current_page == "dashboard":
     st.header("📈 Business Intelligence Dashboard")
 
