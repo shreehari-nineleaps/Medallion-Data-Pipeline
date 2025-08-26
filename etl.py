@@ -13,6 +13,7 @@ sys.path.append(str(Path(__file__).parent))
 from config import LOG_CONFIG
 from silver.silver_builder import SilverBuilder
 from gold.gold_builder import GoldBuilder
+from gold.push import SupabasePusher
 
 # Set up logging
 log_dir = Path(__file__).parent / LOG_CONFIG['log_dir']
@@ -76,6 +77,19 @@ def build_gold():
         return False
 
 
+def push_to_supabase():
+    """Push Gold layer data to Supabase."""
+    logger.info("🚀 Pushing Gold Layer to Supabase...")
+
+    try:
+        pusher = SupabasePusher()
+        return pusher.push_all_gold_tables()
+
+    except Exception as e:
+        logger.error(f"❌ Error pushing to Supabase: {e}")
+        return False
+
+
 def run_full_pipeline():
     """Run the complete ETL pipeline: Bronze -> Silver -> Gold."""
     start_time = datetime.now()
@@ -85,7 +99,8 @@ def run_full_pipeline():
     results = {
         'bronze': False,
         'silver': False,
-        'gold': False
+        'gold': False,
+        'supabase': False
     }
 
     # Build Bronze Layer
@@ -102,6 +117,12 @@ def run_full_pipeline():
         results['gold'] = build_gold()
     else:
         logger.warning("⚠️  Skipping Gold layer due to Silver failures")
+
+    # Push to Supabase (only if Gold succeeds)
+    if results['gold']:
+        results['supabase'] = push_to_supabase()
+    else:
+        logger.warning("⚠️  Skipping Supabase push due to Gold failures")
 
     # Summary
     end_time = datetime.now()
@@ -134,7 +155,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='Medallion Data Pipeline ETL')
-    parser.add_argument('--layer', choices=['bronze', 'silver', 'gold', 'all'],
+    parser.add_argument('--layer', choices=['bronze', 'silver', 'gold', 'supabase', 'all'],
                        default='all', help='Which layer to build')
     parser.add_argument('--force', action='store_true',
                        help='Force rebuild even if layer exists')
@@ -153,6 +174,8 @@ def main():
         success = build_silver()
     elif args.layer == 'gold':
         success = build_gold()
+    elif args.layer == 'supabase':
+        success = push_to_supabase()
     elif args.layer == 'all':
         success = run_full_pipeline()
 
