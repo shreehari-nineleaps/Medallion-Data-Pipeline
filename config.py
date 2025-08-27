@@ -11,7 +11,7 @@ DB_CONFIG = {
 
 # Google Sheets Configuration
 GOOGLE_SHEETS_CONFIG = {
-    'credentials_path': os.getenv('GOOGLE_CREDS_PATH', '/home/nineleaps/Desktop/etl/plenary-agility-469511-r7-9a217afa87a9.json'),
+    'credentials_path': os.getenv('GOOGLE_CREDS_PATH', '/home/nineleaps/Desktop/etl/plenary-agility-469511-r7-26ec3f017851.json'),
     'scopes': ["https://www.googleapis.com/auth/spreadsheets.readonly"],
     'spreadsheet_id': os.getenv('SPREADSHEET_ID', '1Q7ND4AGHcPaqn75kWq3sT7oUHP8UCirNZ6FzgIQbxac')
 }

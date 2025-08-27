@@ -201,13 +201,16 @@ class GoldBuilder:
                         COUNT(DISTINCT so.supply_order_id) AS total_orders,
                         SUM(so.quantity) AS total_units,
                         SUM(so.total_invoice) AS total_revenue,
-                        AVG(EXTRACT(EPOCH FROM (so.delivery_date - so.order_date)) / 86400.0) AS avg_lead_time_days,
+                        AVG(CASE WHEN so.delivered_date IS NOT NULL AND so.order_date IS NOT NULL
+                            THEN (so.delivered_date - so.order_date)
+                            ELSE NULL END) AS avg_lead_time_days,
                         SUM(CASE WHEN so.status IN ('delivered', 'shipped') THEN 1 ELSE 0 END) AS fulfilled_orders,
                         SUM(CASE WHEN so.status = 'delivered' THEN 1 ELSE 0 END) AS delivered_orders,
-                        SUM(CASE WHEN so.on_time = TRUE THEN 1 ELSE 0 END) AS on_time_orders,
-                        SUM(CASE WHEN so.in_full = TRUE THEN 1 ELSE 0 END) AS in_full_orders
+                        SUM(CASE WHEN so.delivered_date <= so.shipped_date + INTERVAL '3 days' THEN 1 ELSE 0 END) AS on_time_orders,
+                        SUM(CASE WHEN so.quantity > 0 THEN 1 ELSE 0 END) AS in_full_orders
                     FROM silver.supply_orders so
-                    JOIN silver.suppliers s ON so.supplier_id = s.supplier_id
+                    JOIN silver.products p ON so.product_id = p.product_id
+                    JOIN silver.suppliers s ON p.supplier_id = s.supplier_id
                     GROUP BY month, s.supplier_id, s.supplier_name
                 )
                 SELECT
