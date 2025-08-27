@@ -42,8 +42,10 @@ class SupabasePusher:
         self.pool_initialized = False
 
         self.gold_tables = [
-            'monthly_sales_performance',
+            'forecasts',
             'inventory_health_metrics',
+            'monthly_sales_performance',
+            'supplier_performance_monthly',
             'supply_chain_dashboard',
             'table_metadata'
         ]
