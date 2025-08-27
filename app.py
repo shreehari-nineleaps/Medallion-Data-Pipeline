@@ -34,39 +34,71 @@ st.set_page_config(
     page_title="Medallion Data Pipeline",
     page_icon="🏭",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 # Custom CSS
 st.markdown("""
 <style>
+    /* Formal, clean styling */
+    :root {
+        --brand-primary: #0f4c81; /* corporate blue */
+        --brand-secondary: #2f4858; /* slate */
+        --brand-accent: #0ea5e9; /* accent blue */
+    }
     .main-header {
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-        padding: 1rem;
+        background: linear-gradient(90deg, var(--brand-primary) 0%, var(--brand-secondary) 100%);
+        padding: 1rem 1.25rem;
         border-radius: 10px;
-        margin-bottom: 2rem;
-        color: white;
-        text-align: center;
+        margin-bottom: 1.5rem;
+        color: #ffffff;
+        text-align: left;
+    }
+    .main-header h1 {
+        font-size: 1.4rem;
+        margin: 0;
+        font-weight: 600;
+        letter-spacing: 0.3px;
     }
     .metric-card {
-        background: white;
-        padding: 1rem;
+        background: #ffffff;
+        padding: 0.9rem 1rem;
         border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        border: 1px solid #e6e8eb;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.05);
         margin: 0.5rem 0;
     }
     .stButton > button {
         width: 100%;
+        border: 1px solid #e6e8eb;
+        background-color: #f8fafc;
+        color: #111827;
     }
-    .success-status {
-        color: #28a745;
+    .stButton > button:hover {
+        border-color: var(--brand-accent);
     }
-    .error-status {
-        color: #dc3545;
-    }
-    .warning-status {
-        color: #ffc107;
-    }
+    .success-status { color: #198754; }
+    .error-status { color: #dc3545; }
+    .warning-status { color: #fd7e14; }
+    .small-muted { color: #6b7280; font-size: 0.85rem; }
+    /* Hide Streamlit default header/menu/footer so navbar is visible */
+    [data-testid="stHeader"] { height: 0px; visibility: hidden; }
+    #MainMenu { visibility: hidden; }
+    footer { visibility: hidden; }
+</style>
+""", unsafe_allow_html=True)
+
+# Compact table theme for dataframes
+st.markdown("""
+<style>
+  /* Compact tables for Database Explorer and Analytics */
+  [data-testid="stDataFrame"] table {
+    font-size: 12px;
+  }
+  [data-testid="stDataFrame"] th, [data-testid="stDataFrame"] td {
+    padding: 4px 6px !important;
+    line-height: 1.2 !important;
+  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -161,32 +193,79 @@ def run_pipeline_stage(stage):
         st.session_state.pipeline_status[stage] = f'Error: {str(e)}'
         return False
 
-# Sidebar navigation
-st.sidebar.markdown("# 🏭 Medallion Pipeline")
-st.sidebar.markdown("---")
-
+# --- Top Navigation Bar Setup ---
 pages = {
-    "🏠 Dashboard Home": "home",
-    "⚙️ Pipeline Control": "pipeline",
-    "🗄️ Database Explorer": "database",
-    "📊 Data Analytics": "analytics",
-    "🔮 Forecasting": "forecasting",
-    "💻 Query Runner": "query",
-    "📈 BI Dashboard": "dashboard"
+    "Dashboard Home": "home",
+    "Pipeline Control": "pipeline",
+    "Database Explorer": "database",
+    "Data Analytics": "analytics",
+    "Forecasting": "forecasting",
+    "Query Runner": "query",
+    "BI Dashboard": "dashboard"
 }
+nav_pages = list(pages.keys())
+if 'current_page' not in st.session_state:
+    st.session_state.current_page = nav_pages[0]
+# --- Top Navbar HTML/CSS/JS ---
+nav_html = """
+<div class=\"top-navbar\">
+  <div class=\"nav-logo\">Medallion Data Pipeline</div>
+</div>
+<div class=\"nav-links-bar\"></div>
+<style>
+.top-navbar {
+  width: 100%;
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  background: linear-gradient(90deg, #1a237e 0%, #3949ab 100%);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 56px;
+  z-index: 10000;
+  box-shadow: 0 2px 8px rgba(30,40,80,0.1);
+}
+.nav-logo {
+  font-weight: 700;
+  font-size: 1.25rem;
+  margin-left: 2rem;
+  letter-spacing: 0.04em;
+}
+.nav-links-bar { height: 0; }
+.stApp {
+  padding-top: 64px !important;
+}
+</style>
+"""
+st.markdown(nav_html, unsafe_allow_html=True)
 
-selected_page = st.sidebar.radio("Navigate to:", list(pages.keys()))
-current_page = pages[selected_page]
+# Streamlit-based navbar buttons (no page reload)
+btn_cols = st.columns(len(nav_pages))
+for i, page in enumerate(nav_pages):
+    with btn_cols[i]:
+        is_active = (st.session_state.current_page == page)
+        if st.button(page, key=f"navbtn_{i}", type=("primary" if is_active else "secondary")):
+            st.session_state.current_page = page
+            st.experimental_set_query_params(page=page)
+            st.experimental_rerun()
 
+# --- Assign current_page variable for routing ---
+import urllib.parse
+params = st.experimental_get_query_params()
+page_value = params.get('page', [st.session_state.current_page])[0]
+if page_value in nav_pages:
+    st.session_state.current_page = page_value
+current_page = pages[st.session_state.current_page]
 # Main header
-st.markdown('<div class="main-header"><h1>🏭 Medallion Data Pipeline Control Center</h1></div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header"><h1>Medallion Data Pipeline — Control Center</h1></div>', unsafe_allow_html=True)
 
 # HOME PAGE
 if current_page == "home":
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
-        st.metric("Pipeline Status", "Active", "↑ Running")
+        st.metric("Pipeline Status", "Active", "Running")
 
     with col2:
         st.metric("Total Tables", "15", "3 layers")
@@ -198,62 +277,57 @@ if current_page == "home":
         try:
             conn = psycopg2.connect(**DB_CONFIG)
             conn.close()
-            status = "🟢 Connected"
+            status = "Connected"
         except:
-            status = "🔴 Disconnected"
+            status = "Disconnected"
         st.metric("Database", status)
 
-        if st.button("🔍 Test Connection", use_container_width=True):
+        if st.button("Test Connection", use_container_width=True):
             try:
                 conn = psycopg2.connect(**DB_CONFIG)
                 cursor = conn.cursor()
                 cursor.execute("SELECT 1")
                 cursor.close()
                 conn.close()
-                st.success("✅ Database connection successful!")
+                st.success("Database connection successful.")
             except Exception as e:
-                st.error(f"❌ Connection failed: {e}")
+                st.error(f"Connection failed: {e}")
 
-    st.markdown("---")
 
     # Pipeline Status Overview
-    st.subheader("🔄 Pipeline Layers Status")
+    st.subheader("Pipeline Layers Status")
     status_cols = st.columns(3)
 
     with status_cols[0]:
         bronze_status = st.session_state.pipeline_status.get('bronze', 'Not Run')
-        color = "🟢" if bronze_status == 'Success' else "🔴" if 'Error' in bronze_status else "🟡"
-        st.markdown(f"### {color} Bronze Layer")
+        st.markdown(f"### Bronze Layer")
         st.write(f"Status: {bronze_status}")
 
     with status_cols[1]:
         silver_status = st.session_state.pipeline_status.get('silver', 'Not Run')
-        color = "🟢" if silver_status == 'Success' else "🔴" if 'Error' in silver_status else "🟡"
-        st.markdown(f"### {color} Silver Layer")
+        st.markdown(f"### Silver Layer")
         st.write(f"Status: {silver_status}")
 
     with status_cols[2]:
         gold_status = st.session_state.pipeline_status.get('gold', 'Not Run')
-        color = "🟢" if gold_status == 'Success' else "🔴" if 'Error' in gold_status else "🟡"
-        st.markdown(f"### {color} Gold Layer")
+        st.markdown(f"### Gold Layer")
         st.write(f"Status: {gold_status}")
 
     # Quick Actions
-    st.markdown("---")
-    st.subheader("🚀 Quick Actions")
+        st.subheader("Quick Actions")
     action_cols = st.columns(4)
 
     with action_cols[0]:
-        if st.button("🔧 Setup Database", use_container_width=True):
+        if st.button("Setup Database", use_container_width=True):
             with st.spinner("Setting up database schemas..."):
                 success = run_pipeline_stage('setup')
                 if success:
-                    st.success("✅ Database schemas created successfully!")
+                    st.success("Database schemas created successfully.")
                 else:
-                    st.error("❌ Database setup failed!")
+                    st.error("Database setup failed.")
 
     with action_cols[1]:
-        if st.button("🥉 Run Bronze", use_container_width=True):
+        if st.button("Run Bronze", use_container_width=True):
             with st.spinner("Running Bronze layer..."):
                 success = run_pipeline_stage('bronze')
                 if success:
@@ -262,7 +336,7 @@ if current_page == "home":
                     st.error("Bronze layer failed!")
 
     with action_cols[2]:
-        if st.button("🥈 Run Silver", use_container_width=True):
+        if st.button("Run Silver", use_container_width=True):
             with st.spinner("Running Silver layer..."):
                 success = run_pipeline_stage('silver')
                 if success:
@@ -271,7 +345,7 @@ if current_page == "home":
                     st.error("Silver layer failed!")
 
     with action_cols[3]:
-        if st.button("🥇 Run Gold", use_container_width=True):
+        if st.button("Run Gold", use_container_width=True):
             with st.spinner("Running Gold layer..."):
                 success = run_pipeline_stage('gold')
                 if success:
@@ -281,9 +355,9 @@ if current_page == "home":
 
 # PIPELINE CONTROL PAGE
 elif current_page == "pipeline":
-    st.header("⚙️ Pipeline Control Center")
+    st.header("Pipeline Control Center")
 
-    tab1, tab2 = st.tabs(["🎮 Manual Control", "📋 Status"])
+    tab1, tab2 = st.tabs(["Manual Control", "Status"])
 
     with tab1:
         col1, col2 = st.columns([2, 1])
@@ -292,7 +366,7 @@ elif current_page == "pipeline":
             st.subheader("Pipeline Execution")
 
             # Full pipeline run
-            st.markdown("### 🚀 Full Pipeline")
+            st.markdown("### Full Pipeline")
             if st.button("Run Complete ETL Pipeline", type="primary", use_container_width=True):
                 with st.spinner("Running full pipeline..."):
                     progress_bar = st.progress(0)
@@ -317,18 +391,17 @@ elif current_page == "pipeline":
                     progress_bar.progress(100)
 
                     if all([setup_success, bronze_success, silver_success, gold_success]):
-                        st.success("🎉 Full pipeline completed successfully!")
+                        st.success("Full pipeline completed successfully.")
                     else:
-                        st.error("❌ Pipeline completed with errors.")
+                        st.error("Pipeline completed with errors.")
 
-            st.markdown("---")
 
             # Individual stages
-            st.markdown("### 🔧 Individual Stages")
+            st.markdown("### Individual Stages")
             stage_cols = st.columns(4)
 
             with stage_cols[0]:
-                if st.button("🔧 Database Setup", use_container_width=True):
+                if st.button("Database Setup", use_container_width=True):
                     with st.spinner("Setting up database schemas..."):
                         success = run_pipeline_stage('setup')
                         if success:
@@ -337,7 +410,7 @@ elif current_page == "pipeline":
                             st.error("❌ Database setup failed!")
 
             with stage_cols[1]:
-                if st.button("🥉 Bronze Layer", use_container_width=True):
+                if st.button("Bronze Layer", use_container_width=True):
                     with st.spinner("Building Bronze layer..."):
                         success = run_pipeline_stage('bronze')
                         if success:
@@ -346,7 +419,7 @@ elif current_page == "pipeline":
                             st.error("Bronze failed!")
 
             with stage_cols[2]:
-                if st.button("🥈 Silver Layer", use_container_width=True):
+                if st.button("Silver Layer", use_container_width=True):
                     with st.spinner("Building Silver layer..."):
                         success = run_pipeline_stage('silver')
                         if success:
@@ -355,7 +428,7 @@ elif current_page == "pipeline":
                             st.error("Silver failed!")
 
             with stage_cols[3]:
-                if st.button("🥇 Gold Layer", use_container_width=True):
+                if st.button("Gold Layer", use_container_width=True):
                     with st.spinner("Building Gold layer..."):
                         success = run_pipeline_stage('gold')
                         if success:
@@ -367,11 +440,11 @@ elif current_page == "pipeline":
             st.subheader("Current Status")
             for layer, status in st.session_state.pipeline_status.items():
                 if status == 'Success':
-                    st.success(f"✅ {layer.title()}: {status}")
+                    st.success(f"{layer.title()}: {status}")
                 elif status == 'Failed' or 'Error' in status:
-                    st.error(f"❌ {layer.title()}: {status}")
+                    st.error(f"{layer.title()}: {status}")
                 else:
-                    st.info(f"ℹ️ {layer.title()}: {status}")
+                    st.info(f"{layer.title()}: {status}")
 
     with tab2:
         st.subheader("📊 Pipeline Statistics")
@@ -379,18 +452,19 @@ elif current_page == "pipeline":
         # Show some mock statistics
         stats_cols = st.columns(3)
 
-        with stats_cols[0]:
-            st.metric("Records Processed", "1,250,000", "↑ 15%")
-
-        with stats_cols[1]:
-            st.metric("Data Quality", "97.8%", "↑ 2.1%")
-
-        with stats_cols[2]:
-            st.metric("Processing Time", "4.2 min", "↓ 30s")
+        with st.container():
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            with stats_cols[0]:
+                st.metric("Records Processed", "1,250,000", "↑ 15%")
+            with stats_cols[1]:
+                st.metric("Data Quality", "97.8%", "↑ 2.1%")
+            with stats_cols[2]:
+                st.metric("Processing Time", "4.2 min", "↓ 30s")
+            st.markdown('</div>', unsafe_allow_html=True)
 
 # DATABASE EXPLORER PAGE
 elif current_page == "database":
-    st.header("🗄️ Database Explorer")
+    st.header("Database Explorer")
 
     conn = get_database_connection()
     if not conn:
@@ -426,58 +500,52 @@ elif current_page == "database":
         st.stop()
 
     col1, col2 = st.columns([3, 1])
-
-    with col2:
-        st.subheader("📊 Table Info")
-
-        # Get table info
-        info_query = f"""
-        SELECT column_name, data_type, is_nullable
-        FROM information_schema.columns
-        WHERE table_schema = '{selected_schema}'
-        AND table_name = '{selected_table}'
-        ORDER BY ordinal_position;
-        """
-
-        info_df = execute_query(info_query)
-        if info_df is not None:
-            st.dataframe(info_df, use_container_width=True)
-
-        # Get row count
-        count_query = f"SELECT COUNT(*) as row_count FROM {full_table_name}"
-        count_result = execute_query(count_query)
-        if count_result is not None:
-            row_count = count_result.iloc[0]['row_count']
-            st.metric("Total Rows", row_count)
-
-    with col1:
-        st.subheader(f"📋 {selected_schema}.{selected_table}")
-
-        # Pagination
-        rows_per_page = st.slider("Rows per page:", 10, 100, 50)
-        page_number = st.number_input("Page:", min_value=1, value=1)
-        offset = (page_number - 1) * rows_per_page
-
-        # Data query with pagination
-        data_query = f"""
-        SELECT * FROM {full_table_name}
-        LIMIT {rows_per_page} OFFSET {offset}
-        """
-
-        data_df = execute_query(data_query)
-        if data_df is not None and not data_df.empty:
-            st.dataframe(data_df, use_container_width=True)
-
-            # Export options
-            csv_data = data_df.to_csv(index=False)
-            st.download_button(
-                label="📥 Download as CSV",
-                data=csv_data,
-                file_name=f"{selected_schema}_{selected_table}.csv",
-                mime='text/csv'
-            )
-        else:
-            st.info("No data found in this table.")
+    with st.container():
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        with col2:
+            st.subheader("Table Info")
+            # Get table info
+            info_query = f"""
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = '{selected_schema}'
+            AND table_name = '{selected_table}'
+            ORDER BY ordinal_position;
+            """
+            info_df = execute_query(info_query)
+            if info_df is not None:
+                st.dataframe(info_df, use_container_width=True)
+            # Get row count
+            count_query = f"SELECT COUNT(*) as row_count FROM {full_table_name}"
+            count_result = execute_query(count_query)
+            if count_result is not None:
+                row_count = count_result.iloc[0]['row_count']
+                st.metric("Total Rows", row_count)
+        with col1:
+            st.subheader(f"{selected_schema}.{selected_table}")
+            # Pagination
+            rows_per_page = st.slider("Rows per page:", 10, 100, 50)
+            page_number = st.number_input("Page:", min_value=1, value=1)
+            offset = (page_number - 1) * rows_per_page
+            # Data query with pagination
+            data_query = f"""
+            SELECT * FROM {full_table_name}
+            LIMIT {rows_per_page} OFFSET {offset}
+            """
+            data_df = execute_query(data_query)
+            if data_df is not None and not data_df.empty:
+                st.dataframe(data_df, use_container_width=True)
+                # Export options
+                csv_data = data_df.to_csv(index=False)
+                st.download_button(
+                    label="Download as CSV",
+                    data=csv_data,
+                    file_name=f"{selected_schema}_{selected_table}.csv",
+                    mime='text/csv'
+                )
+            else:
+                st.info("No data found in this table.")
+        st.markdown('</div>', unsafe_allow_html=True)
 
 # DATA ANALYTICS PAGE
 elif current_page == "analytics":
@@ -752,8 +820,6 @@ elif current_page == "forecasting":
     - **Duration** → select forecast horizon  
     """)
 
-    st.markdown("---")
-
     # 🔹 Fetch filter values safely
     try:
         product_ids = execute_query("SELECT DISTINCT product_id FROM silver.supply_orders ORDER BY product_id LIMIT 200")
@@ -782,8 +848,6 @@ elif current_page == "forecasting":
     with col3:
         duration = st.selectbox("📅 Duration", ["4 weeks", "8 weeks", "12 weeks", "6 months", "12 months"])
 
-    st.markdown("---")
-
     # 🔹 Button to trigger simple_forecasting.py
     if st.button("🚀 Run Forecasting", type="primary", use_container_width=True):
         with st.spinner("Running forecasting pipeline... ⏳"):
@@ -801,8 +865,6 @@ elif current_page == "forecasting":
             except Exception as e:
                 st.error(f"❌ Error running forecasting: {str(e)}")
                 st.exception(e)
-
-    st.markdown("---")
 
     # 🔹 Show Forecast Results
     st.subheader("📊 Forecast Results")
@@ -883,13 +945,11 @@ elif current_page == "dashboard":
     except Exception as e:
         st.error(f"Error loading metrics: {e}")
 
-    st.markdown("---")
-
     # Charts section
     chart_cols = st.columns(2)
 
     with chart_cols[0]:
-        st.subheader("📈 Revenue Trend")
+        st.subheader("Revenue Trend")
         try:
             # Monthly revenue trend
             trend_query = """
@@ -913,7 +973,7 @@ elif current_page == "dashboard":
             st.error(f"Error loading revenue trend: {e}")
 
     with chart_cols[1]:
-        st.subheader("🏆 Top Products")
+        st.subheader("Top Products")
         try:
             # Top products by revenue
             top_products_query = """
@@ -937,7 +997,6 @@ elif current_page == "dashboard":
             st.error(f"Error loading top products: {e}")
 
     # External BI Tools section
-    st.markdown("---")
     st.subheader("🔗 External BI Tools Integration")
 
     tool = st.selectbox("Select BI Tool:", ["None", "Power BI", "Tableau", "Looker Studio"])
@@ -952,30 +1011,27 @@ elif current_page == "dashboard":
             "Password": "••••••••••"
         })
 
-# Sidebar status
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 🛠️ System Status")
+
+
 
 # Database status
 try:
     conn = get_database_connection()
     if conn:
-        st.sidebar.success("🟢 Database Connected")
+        st.success("Database connection successful.")
         conn.close()
     else:
-        st.sidebar.error("🔴 Database Disconnected")
-except:
-    st.sidebar.error("🔴 Database Error")
+        st.error("Database connection failed.")
+except Exception as e:
+    st.error(f"Database connection error: {e}")
+
 
 # Pipeline status
-st.sidebar.markdown("### 🔄 Pipeline Status")
+
 for layer, status in st.session_state.pipeline_status.items():
     if status == 'Success':
-        st.sidebar.success(f"✅ {layer.title()}")
+        st.success(f"{layer.title()}: {status}")
     elif status == 'Failed' or 'Error' in status:
-        st.sidebar.error(f"❌ {layer.title()}")
+        st.error(f"{layer.title()}: {status}")
     else:
-        st.sidebar.info(f"ℹ️ {layer.title()}: {status}")
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("*Built with ❤️ using Streamlit*")
+        st.info(f"{layer.title()}: {status}")

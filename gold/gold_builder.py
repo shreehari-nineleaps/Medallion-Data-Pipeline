@@ -71,7 +71,7 @@ class GoldBuilder:
             conn.close()
 
     def create_aggregate_tables(self):
-        """Create the two required aggregate tables."""
+        """Create the three required aggregate tables."""
         logger.info("🔄 Creating Gold aggregate tables...")
 
         conn = self.get_connection()
@@ -188,6 +188,50 @@ class GoldBuilder:
             count2 = cursor.fetchone()[0]
             logger.info(f"✅ inventory_health_metrics created with {count2:,} rows")
 
+            # Aggregate Table 3: Supplier Performance Monthly
+            logger.info("Creating supplier_performance_monthly aggregate...")
+            cursor.execute("DROP TABLE IF EXISTS gold.supplier_performance_monthly CASCADE")
+            cursor.execute("""
+                CREATE TABLE gold.supplier_performance_monthly AS
+                WITH base AS (
+                    SELECT
+                        DATE_TRUNC('month', so.order_date) AS month,
+                        s.supplier_id,
+                        s.supplier_name,
+                        COUNT(DISTINCT so.supply_order_id) AS total_orders,
+                        SUM(so.quantity) AS total_units,
+                        SUM(so.total_invoice) AS total_revenue,
+                        AVG(EXTRACT(EPOCH FROM (so.delivery_date - so.order_date)) / 86400.0) AS avg_lead_time_days,
+                        SUM(CASE WHEN so.status IN ('delivered', 'shipped') THEN 1 ELSE 0 END) AS fulfilled_orders,
+                        SUM(CASE WHEN so.status = 'delivered' THEN 1 ELSE 0 END) AS delivered_orders,
+                        SUM(CASE WHEN so.on_time = TRUE THEN 1 ELSE 0 END) AS on_time_orders,
+                        SUM(CASE WHEN so.in_full = TRUE THEN 1 ELSE 0 END) AS in_full_orders
+                    FROM silver.supply_orders so
+                    JOIN silver.suppliers s ON so.supplier_id = s.supplier_id
+                    GROUP BY month, s.supplier_id, s.supplier_name
+                )
+                SELECT
+                    month,
+                    supplier_id,
+                    supplier_name,
+                    total_orders,
+                    total_units,
+                    total_revenue,
+                    ROUND(avg_lead_time_days::NUMERIC, 2) AS avg_lead_time_days,
+                    fulfilled_orders,
+                    delivered_orders,
+                    ROUND((on_time_orders::NUMERIC / NULLIF(total_orders, 0)) * 100, 2) AS on_time_rate_pct,
+                    ROUND((in_full_orders::NUMERIC / NULLIF(total_orders, 0)) * 100, 2) AS in_full_rate_pct,
+                    ROUND(((on_time_orders::NUMERIC > 0)::INT + (in_full_orders::NUMERIC > 0)::INT) / 2.0 * 100, 2) AS otif_proxy_pct,
+                    CURRENT_TIMESTAMP AS created_at
+                FROM base
+                ORDER BY month DESC, total_revenue DESC
+            """)
+
+            cursor.execute("SELECT COUNT(*) FROM gold.supplier_performance_monthly")
+            count3 = cursor.fetchone()[0]
+            logger.info(f"✅ supplier_performance_monthly created with {count3:,} rows")
+
             # Log metadata
             self._log_table_metadata(cursor, 'monthly_sales_performance',
                                    'Monthly sales performance by region, store type, and product category',
@@ -198,6 +242,11 @@ class GoldBuilder:
                                    'Inventory health and capacity utilization metrics by warehouse and category',
                                    ['silver.inventory', 'silver.warehouses', 'silver.products'],
                                    'Daily', count2)
+
+            self._log_table_metadata(cursor, 'supplier_performance_monthly',
+                                   'Monthly supplier performance metrics including lead time and OTIF proxies',
+                                   ['silver.supply_orders', 'silver.suppliers'],
+                                   'Monthly', count3)
 
             conn.commit()
             logger.info("✅ Aggregate tables created successfully")
@@ -236,30 +285,36 @@ class GoldBuilder:
                         so.price,
                         so.total_invoice,
 
-                        -- Product details
-                        p.product_name,
-                        p.product_category,
+                        -- Natural keys for BI joins
+                        so.product_id,
+                        so.warehouse_id,
+                        so.retail_store_id,
+
+                        -- Product details (COALESCE to handle missing dims)
+                        COALESCE(p.product_name, 'Unknown') as product_name,
+                        COALESCE(p.product_category, 'Unknown') as product_category,
                         p.unit_cost,
                         p.selling_price,
-                        p.selling_price - p.unit_cost as profit_margin,
-                        ROUND(((p.selling_price - p.unit_cost) / p.unit_cost * 100)::NUMERIC, 2) as profit_margin_pct,
+                        (p.selling_price - p.unit_cost) as profit_margin,
+                        ROUND(((p.selling_price - p.unit_cost) / NULLIF(p.unit_cost, 0) * 100)::NUMERIC, 2) as profit_margin_pct,
 
                         -- Supplier details
-                        s.supplier_name,
+                        COALESCE(s.supplier_id, -1) as supplier_id,
+                        COALESCE(s.supplier_name, 'Unknown') as supplier_name,
                         s.contact_email as supplier_email,
 
                         -- Warehouse details
-                        w.warehouse_name,
-                        w.city as warehouse_city,
-                        w.region as warehouse_region,
+                        COALESCE(w.warehouse_name, 'Unknown') as warehouse_name,
+                        COALESCE(w.city, 'Unknown') as warehouse_city,
+                        COALESCE(w.region, 'Unknown') as warehouse_region,
                         w.storage_capacity,
 
                         -- Retail store details
-                        rs.store_name,
-                        rs.city as store_city,
-                        rs.region as store_region,
-                        rs.store_type,
-                        rs.store_status,
+                        COALESCE(rs.store_name, 'Unknown') as store_name,
+                        COALESCE(rs.city, 'Unknown') as store_city,
+                        COALESCE(rs.region, 'Unknown') as store_region,
+                        COALESCE(rs.store_type, 'Unknown') as store_type,
+                        COALESCE(rs.store_status, 'unknown') as store_status,
 
                         -- Calculated fields
                         CASE
@@ -278,17 +333,31 @@ class GoldBuilder:
                         EXTRACT(MONTH FROM so.order_date) as order_month,
                         EXTRACT(QUARTER FROM so.order_date) as order_quarter,
                         TO_CHAR(so.order_date, 'YYYY-MM') as order_year_month,
-                        TO_CHAR(so.order_date, 'Day') as order_day_of_week,
+                        EXTRACT(ISODOW FROM so.order_date) as order_isodow,
+                        CAST(TO_CHAR(so.order_date, 'YYYYMMDD') AS INTEGER) as order_date_key,
 
-                        -- Business metrics
-                        so.quantity * p.unit_cost as total_cost,
-                        so.total_invoice - (so.quantity * p.unit_cost) as total_profit
+                        -- Business metrics (typed)
+                        ROUND((so.quantity * p.unit_cost)::NUMERIC, 2) as total_cost,
+                        ROUND((so.total_invoice - (so.quantity * p.unit_cost))::NUMERIC, 2) as total_profit,
+
+                        -- Status flags
+                        (so.status = 'shipped')::BOOLEAN as is_shipped,
+                        (so.status = 'delivered')::BOOLEAN as is_delivered,
+                        (so.status = 'canceled')::BOOLEAN as is_canceled,
+
+                        -- DQ flags based on LEFT JOIN nulls and value checks
+                        (p.product_id IS NULL OR s.supplier_id IS NULL OR w.warehouse_id IS NULL OR rs.retail_store_id IS NULL) as dq_missing_dim,
+                        (so.quantity < 0 OR so.price < 0 OR so.total_invoice < 0) as dq_negative_amount,
+                        ((so.shipped_date IS NOT NULL AND so.shipped_date < so.order_date) OR (so.delivered_date IS NOT NULL AND so.delivered_date < so.order_date)) as dq_invalid_dates,
+
+                        -- Order age and backlog helpers
+                        (CURRENT_DATE - so.order_date) as order_age_days
 
                     FROM silver.supply_orders so
-                    JOIN silver.products p ON so.product_id = p.product_id
-                    JOIN silver.suppliers s ON p.supplier_id = s.supplier_id
-                    JOIN silver.warehouses w ON so.warehouse_id = w.warehouse_id
-                    JOIN silver.retail_stores rs ON so.retail_store_id = rs.retail_store_id
+                    LEFT JOIN silver.products p ON so.product_id = p.product_id
+                    LEFT JOIN silver.suppliers s ON p.supplier_id = s.supplier_id
+                    LEFT JOIN silver.warehouses w ON so.warehouse_id = w.warehouse_id
+                    LEFT JOIN silver.retail_stores rs ON so.retail_store_id = rs.retail_store_id
                 ),
                 enhanced_details AS (
                     SELECT
@@ -324,6 +393,9 @@ class GoldBuilder:
                             ELSE 'Cross Region'
                         END as distribution_type,
 
+                        -- Backlog flag: undelivered orders older than 7 days
+                        (order_status <> 'delivered' AND order_age_days > 7) as is_backlog,
+
                         CURRENT_TIMESTAMP as created_at,
                         CURRENT_DATE as snapshot_date
 
@@ -336,6 +408,15 @@ class GoldBuilder:
             cursor.execute("SELECT COUNT(*) FROM gold.supply_chain_dashboard")
             count = cursor.fetchone()[0]
             logger.info(f"✅ supply_chain_dashboard created with {count:,} rows")
+
+            # Helpful indexes for BI slicing
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_gscd_order_date ON gold.supply_chain_dashboard(order_date)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_gscd_order_year_month ON gold.supply_chain_dashboard(order_year_month)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_gscd_product_category ON gold.supply_chain_dashboard(product_category)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_gscd_supplier_name ON gold.supply_chain_dashboard(supplier_name)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_gscd_warehouse_region ON gold.supply_chain_dashboard(warehouse_region)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_gscd_store_region ON gold.supply_chain_dashboard(store_region)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_gscd_order_status ON gold.supply_chain_dashboard(order_status)")
 
             # Log metadata
             self._log_table_metadata(cursor, 'supply_chain_dashboard',
@@ -370,90 +451,9 @@ class GoldBuilder:
         """, (table_name, description, source_tables, frequency, row_count))
 
     def create_business_views(self):
-        """Create additional business views for analytics."""
-        logger.info("🔄 Creating business views...")
-
-        conn = self.get_connection()
-        if not conn:
-            return False
-
-        try:
-            cursor = conn.cursor()
-
-            # Top Performing Products View
-            cursor.execute("""
-                CREATE OR REPLACE VIEW gold.top_performing_products AS
-                SELECT
-                    p.product_name,
-                    p.product_category,
-                    s.supplier_name,
-                    COUNT(DISTINCT so.supply_order_id) as total_orders,
-                    SUM(so.quantity) as total_quantity_sold,
-                    SUM(so.total_invoice) as total_revenue,
-                    AVG(so.total_invoice) as avg_order_value,
-                    SUM(so.total_invoice - (so.quantity * p.unit_cost)) as total_profit,
-                    ROUND(AVG((p.selling_price - p.unit_cost) / p.unit_cost * 100)::NUMERIC, 2) as avg_profit_margin_pct,
-                    COUNT(DISTINCT so.retail_store_id) as store_reach
-                FROM silver.supply_orders so
-                JOIN silver.products p ON so.product_id = p.product_id
-                JOIN silver.suppliers s ON p.supplier_id = s.supplier_id
-                WHERE so.status IN ('delivered', 'shipped')
-                GROUP BY p.product_id, p.product_name, p.product_category, s.supplier_name
-                ORDER BY total_revenue DESC
-            """)
-
-            # Regional Performance View
-            cursor.execute("""
-                CREATE OR REPLACE VIEW gold.regional_performance AS
-                SELECT
-                    rs.region,
-                    COUNT(DISTINCT rs.retail_store_id) as total_stores,
-                    COUNT(DISTINCT so.supply_order_id) as total_orders,
-                    SUM(so.total_invoice) as total_revenue,
-                    AVG(so.total_invoice) as avg_order_value,
-                    COUNT(DISTINCT so.product_id) as unique_products_sold,
-                    SUM(CASE WHEN so.status = 'delivered' THEN 1 ELSE 0 END) as delivered_orders,
-                    ROUND((SUM(CASE WHEN so.status = 'delivered' THEN 1 ELSE 0 END)::NUMERIC /
-                           NULLIF(COUNT(so.supply_order_id), 0) * 100), 2) as delivery_success_rate,
-                    ROUND((SUM(so.total_invoice) / NULLIF(COUNT(DISTINCT rs.retail_store_id), 0))::NUMERIC, 2) as revenue_per_store
-                FROM silver.retail_stores rs
-                LEFT JOIN silver.supply_orders so ON rs.retail_store_id = so.retail_store_id
-                WHERE rs.store_status = 'active'
-                GROUP BY rs.region
-                ORDER BY total_revenue DESC
-            """)
-
-            # Supplier Performance View
-            cursor.execute("""
-                CREATE OR REPLACE VIEW gold.supplier_performance AS
-                SELECT
-                    s.supplier_name,
-                    s.contact_email,
-                    COUNT(DISTINCT p.product_id) as products_supplied,
-                    COUNT(DISTINCT so.supply_order_id) as total_orders,
-                    SUM(so.quantity) as total_units_sold,
-                    SUM(so.total_invoice) as total_revenue_generated,
-                    AVG(p.selling_price - p.unit_cost) as avg_profit_per_unit,
-                    COUNT(DISTINCT so.retail_store_id) as store_coverage,
-                    SUM(CASE WHEN so.status = 'delivered' THEN 1 ELSE 0 END) as successful_deliveries,
-                    ROUND((SUM(CASE WHEN so.status = 'delivered' THEN 1 ELSE 0 END)::NUMERIC /
-                           NULLIF(COUNT(so.supply_order_id), 0) * 100), 2) as delivery_success_rate
-                FROM silver.suppliers s
-                JOIN silver.products p ON s.supplier_id = p.supplier_id
-                LEFT JOIN silver.supply_orders so ON p.product_id = so.product_id
-                GROUP BY s.supplier_id, s.supplier_name, s.contact_email
-                ORDER BY total_revenue_generated DESC
-            """)
-
-            logger.info("✅ Business views created successfully")
-            return True
-
-        except psycopg2.Error as e:
-            logger.error(f"Error creating business views: {e}")
-            return False
-        finally:
-            cursor.close()
-            conn.close()
+        """Skip creating extra business views to keep only 3 aggregates + 1 dashboard."""
+        logger.info("ℹ️ Skipping creation of business views as per requirements (3 aggregates + 1 dashboard only)")
+        return True
 
     def run_gold_quality_checks(self):
         """Run quality checks on Gold layer tables."""
@@ -470,6 +470,11 @@ class GoldBuilder:
                 ('capacity_not_exceeded', "SELECT COUNT(*) FROM gold.inventory_health_metrics WHERE capacity_utilization_pct > 100"),
                 ('non_negative_stock', "SELECT COUNT(*) FROM gold.inventory_health_metrics WHERE total_stock_quantity < 0"),
                 ('valid_warehouse_data', "SELECT COUNT(*) FROM gold.inventory_health_metrics WHERE warehouse_name IS NULL")
+            ],
+            'supplier_performance_monthly': [
+                ('non_negative_revenue', "SELECT COUNT(*) FROM gold.supplier_performance_monthly WHERE total_revenue < 0"),
+                ('valid_rates', "SELECT COUNT(*) FROM gold.supplier_performance_monthly WHERE on_time_rate_pct < 0 OR on_time_rate_pct > 100 OR in_full_rate_pct < 0 OR in_full_rate_pct > 100"),
+                ('lead_time_not_negative', "SELECT COUNT(*) FROM gold.supplier_performance_monthly WHERE avg_lead_time_days < 0")
             ],
             'supply_chain_dashboard': [
                 ('valid_profit_margins', "SELECT COUNT(*) FROM gold.supply_chain_dashboard WHERE profit_margin IS NULL AND order_status = 'delivered'"),
@@ -527,8 +532,8 @@ class GoldBuilder:
         try:
             cursor = conn.cursor()
 
-            # Get counts for all gold tables
-            gold_tables = ['monthly_sales_performance', 'inventory_health_metrics', 'supply_chain_dashboard']
+            # Get counts for all gold tables (3 aggregates + 1 dashboard)
+            gold_tables = ['monthly_sales_performance', 'inventory_health_metrics', 'supplier_performance_monthly', 'supply_chain_dashboard']
             total_records = 0
 
             for table in gold_tables:
@@ -540,16 +545,8 @@ class GoldBuilder:
                 except:
                     logger.info(f"  {table:<25}: Not created")
 
-            # Get view counts
-            views = ['top_performing_products', 'regional_performance', 'supplier_performance']
-            logger.info("\n📈 Business Views:")
-            for view in views:
-                try:
-                    cursor.execute(f"SELECT COUNT(*) FROM gold.{view}")
-                    count = cursor.fetchone()[0]
-                    logger.info(f"  {view:<25}: {count:>8,} records")
-                except:
-                    logger.info(f"  {view:<25}: Not created")
+            # No extra views are created by design
+            logger.info("\n📈 Business Views: Skipped by design")
 
             logger.info("-" * 60)
             logger.info(f"  {'TOTAL GOLD RECORDS':<25}: {total_records:>8,}")
