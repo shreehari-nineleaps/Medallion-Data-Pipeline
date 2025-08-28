@@ -184,8 +184,8 @@ class SilverDataCleaner:
 
         return None
 
-    def clean_status_field(self, value, valid_statuses=None):
-        """Clean status fields."""
+    def clean_status_field(self, value, status_mapping=None):
+        """Clean status fields with comprehensive mapping."""
         if not value or pd.isna(value):
             return 'unknown'
 
@@ -193,11 +193,11 @@ class SilverDataCleaner:
         if not value_str or value_str.upper() in self.null_values:
             return 'unknown'
 
-        if valid_statuses:
-            # Check if it matches any valid status
-            for status in valid_statuses:
-                if status.lower() in value_str or value_str in status.lower():
-                    return status.lower()
+        if status_mapping:
+            # Check mapping dictionary for standardization
+            for standard_status, variants in status_mapping.items():
+                if value_str in [v.lower() for v in variants]:
+                    return standard_status
 
         return value_str.lower()
 
@@ -205,6 +205,77 @@ class SilverDataCleaner:
         """Clean category fields."""
         cleaned = self.clean_text_field(value)
         return cleaned if cleaned else 'Uncategorized'
+
+    def parse_category_field(self, value):
+        """Parse category into main_category and sub_category."""
+        if not value or pd.isna(value):
+            return 'Uncategorized', 'General'
+
+        # Clean the value first
+        cleaned_value = self.clean_text_field(value)
+        if not cleaned_value:
+            return 'Uncategorized', 'General'
+
+        # Handle common separators and extract main and sub categories
+        separators = [' > ', '>', ' - ', '-', ' | ', '|', ' / ', '/']
+
+        for separator in separators:
+            if separator in cleaned_value:
+                parts = [part.strip() for part in cleaned_value.split(separator, 1)]
+                if len(parts) >= 2 and parts[0] and parts[1]:
+                    main_cat = self.clean_text_field(parts[0])
+                    sub_cat = self.clean_text_field(parts[1])
+
+                    # Ensure we have valid strings after cleaning
+                    if not main_cat:
+                        main_cat = 'Uncategorized'
+                    if not sub_cat:
+                        sub_cat = 'General'
+
+                    # Fix common typos in main categories
+                    main_cat_fixes = {
+                        'autmootive': 'Automotive',
+                        'automotiev': 'Automotive',
+                        'automotive': 'Automotive',
+                        'safety': 'Safety',
+                        'asafety': 'Safety',
+                        'asfety': 'Safety'
+                    }
+
+                    main_lower = (main_cat or '').lower().replace(' parts', '').strip()
+                    for typo, correct in main_cat_fixes.items():
+                        if typo in main_lower:
+                            main_cat = correct + ' Parts' if 'parts' in cleaned_value.lower() else correct
+                            break
+                    else:
+                        # Capitalize properly
+                        main_cat = ' '.join(word.capitalize() for word in (main_cat or '').split())
+
+                    # Fix common typos in sub categories
+                    sub_cat_fixes = {
+                        'battreies': 'Batteries',
+                        'battreis': 'Batteries',
+                        'batteries': 'Batteries',
+                        'high vis': 'High Visibility',
+                        'tires': 'Tires',
+                        'filters': 'Filters',
+                        'body parts': 'Body Parts'
+                    }
+
+                    sub_lower = (sub_cat or '').lower()
+                    for typo, correct in sub_cat_fixes.items():
+                        if typo in sub_lower:
+                            sub_cat = correct
+                            break
+                    else:
+                        # Capitalize properly
+                        sub_cat = ' '.join(word.capitalize() for word in (sub_cat or '').split())
+
+                    return main_cat, sub_cat
+
+        # No separator found, treat as main category
+        main_cat = ' '.join(word.capitalize() for word in cleaned_value.split())
+        return main_cat, 'General'
 
 
 class SilverBuilder:
@@ -262,6 +333,8 @@ class SilverBuilder:
                     selling_price DECIMAL(15,4) CHECK (selling_price >= 0),
                     supplier_id INT,
                     product_category TEXT DEFAULT 'Uncategorized',
+                    main_category TEXT DEFAULT 'Uncategorized',
+                    sub_category TEXT DEFAULT 'General',
                     status TEXT DEFAULT 'active',
                     price_margin DECIMAL(15,4),
                     quality_score DECIMAL(5,2),
@@ -503,10 +576,17 @@ class SilverBuilder:
 
                 cleaned_supplier_id = self.cleaner.clean_integer_field(supplier_id)
                 cleaned_category = self.cleaner.clean_category_field(product_category)
-                if cleaned_category != product_category:
+                main_category, sub_category = self.cleaner.parse_category_field(product_category)
+                if cleaned_category != product_category or main_category != 'Uncategorized':
                     issues_count += 1
 
-                cleaned_status = self.cleaner.clean_status_field(status, ['active', 'discontinued'])
+                # Define product status mapping
+                product_status_mapping = {
+                    'active': ['active', 'Active', 'ACTIVE'],
+                    'discontinued': ['discontinued', 'Discontinued', 'DISCONTINUED', 'inactive']
+                }
+
+                cleaned_status = self.cleaner.clean_status_field(status, product_status_mapping)
                 if cleaned_status != status:
                     issues_count += 1
 
@@ -531,10 +611,10 @@ class SilverBuilder:
                 cursor.execute("""
                     INSERT INTO silver.products
                     (product_id, product_name, unit_cost, selling_price, supplier_id,
-                     product_category, status, price_margin, quality_score)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     product_category, main_category, sub_category, status, price_margin, quality_score)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (product_id, cleaned_name, cleaned_unit_cost, cleaned_selling_price,
-                      cleaned_supplier_id, cleaned_category, cleaned_status, price_margin, quality_score))
+                      cleaned_supplier_id, cleaned_category, main_category, sub_category, cleaned_status, price_margin, quality_score))
 
                 stats['processed'] += 1
                 if issues_count > 0:
@@ -681,7 +761,14 @@ class SilverBuilder:
                 if cleaned_type != store_type:
                     issues_count += 1
 
-                cleaned_status = self.cleaner.clean_status_field(store_status, ['active', 'inactive', 'closed'])
+                # Define retail store status mapping
+                store_status_mapping = {
+                    'active': ['active', 'Active', 'ACTIVE', 'open', 'Open', 'OPEN'],
+                    'inactive': ['inactive', 'Inactive', 'INACTIVE', 'closed', 'Closed', 'CLOSED'],
+                    'closed': ['closed', 'Closed', 'CLOSED', 'shutdown', 'Shutdown', 'SHUTDOWN']
+                }
+
+                cleaned_status = self.cleaner.clean_status_field(store_status, store_status_mapping)
                 if cleaned_status != store_status:
                     issues_count += 1
 
@@ -763,7 +850,15 @@ class SilverBuilder:
                 cleaned_shipped_date = self.cleaner.clean_date_field(shipped_date)
                 cleaned_delivered_date = self.cleaner.clean_date_field(delivered_date)
 
-                cleaned_status = self.cleaner.clean_status_field(status, ['pending', 'processing', 'shipped', 'delivered', 'cancelled'])
+                # Define comprehensive supply order status mapping
+                supply_order_status_mapping = {
+                    'pending': ['pending', 'Pending', 'PENDING', 'Awaiting', 'Processing', 'In Process'],
+                    'shipped': ['shipped', 'Shipped', 'SHIPPED', 'Dispatched', 'In Transit', 'On Route'],
+                    'delivered': ['delivered', 'Delivered', 'DELIVERED', 'Complete', 'Completed', 'Received'],
+                    'cancelled': ['cancelled', 'Cancelled', 'CANCELLED', 'Canceled', 'Void']
+                }
+
+                cleaned_status = self.cleaner.clean_status_field(status, supply_order_status_mapping)
 
                 # Skip if essential data is missing
                 if not cleaned_order_date or cleaned_quantity is None or cleaned_quantity < 0 or cleaned_price is None:

@@ -51,7 +51,7 @@ Medallion-Data-Pipeline/
 │   ├── etl.py                # Main orchestration script
 │   ├── config.py             # Configuration management
 │   ├── scheduler_manager.py   # Job scheduling system
-│   ├── simple_forecasting.py # ML forecasting pipeline
+│   ├── forecasting.py # ML forecasting pipeline
 │   └── delete_all_data.py    # Data cleanup utility
 ├── 📝 Documentation/
 │   ├── README.md             # This file
@@ -236,7 +236,7 @@ python push.py --table monthly_sales_performance  # Single table
 ### 🔮 **Forecasting Pipeline**
 ```bash
 # Generate demand forecasts
-python simple_forecasting.py
+python forecasting.py
 
 # Available models: prophet, sarimax, lgbm
 # Granularity: daily, weekly, monthly
@@ -304,7 +304,7 @@ python etl.py all            # Complete end-to-end pipeline
 python delete_all_data.py    # Clean reset (Bronze → Silver → Gold)
 
 # Forecasting
-python simple_forecasting.py # Generate ML forecasts
+python forecasting.py # Generate ML forecasts
 
 # Dashboard
 streamlit run app.py         # Launch web interface

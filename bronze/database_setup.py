@@ -181,9 +181,7 @@ def create_silver_gold_views():
                 supplier_id,
                 TRIM(supplier_name) as supplier_name,
                 LOWER(TRIM(contact_email)) as contact_email,
-                TRIM(phone_number) as phone_number,
-                created_at,
-                updated_at
+                TRIM(phone_number) as phone_number
             FROM bronze.suppliers
             WHERE supplier_name IS NOT NULL
             AND contact_email IS NOT NULL
@@ -199,9 +197,7 @@ def create_silver_gold_views():
                 p.selling_price,
                 p.supplier_id,
                 TRIM(p.product_category) as product_category,
-                p.status,
-                p.created_at,
-                p.updated_at
+                p.status
             FROM bronze.products p
             WHERE p.unit_cost > 0 AND p.selling_price > 0
         """)
@@ -229,11 +225,13 @@ def create_silver_gold_views():
                 so.order_date,
                 so.status,
                 COUNT(*) as order_count,
-                SUM(so.quantity) as total_quantity,
-                SUM(so.total_invoice) as total_revenue,
-                AVG(so.total_invoice) as avg_order_value,
+                SUM(CAST(so.quantity AS INTEGER)) as total_quantity,
+                SUM(CAST(so.total_invoice AS DECIMAL(15,2))) as total_revenue,
+                AVG(CAST(so.total_invoice AS DECIMAL(15,2))) as avg_order_value,
                 COUNT(DISTINCT so.retail_store_id) as unique_stores
             FROM bronze.supply_orders so
+            WHERE so.quantity ~ '^[0-9]+$'
+            AND so.total_invoice ~ '^[0-9]+\.?[0-9]*$'
             GROUP BY so.order_date, so.status
             ORDER BY so.order_date DESC
         """)
@@ -246,12 +244,14 @@ def create_silver_gold_views():
                 rs.region,
                 rs.store_type,
                 COUNT(so.supply_order_id) as total_orders,
-                SUM(so.total_invoice) as total_revenue,
-                AVG(so.total_invoice) as avg_order_value,
-                SUM(so.quantity) as total_quantity_ordered
+                SUM(CAST(so.total_invoice AS DECIMAL(15,2))) as total_revenue,
+                AVG(CAST(so.total_invoice AS DECIMAL(15,2))) as avg_order_value,
+                SUM(CAST(so.quantity AS INTEGER)) as total_quantity_ordered
             FROM bronze.retail_stores rs
-            LEFT JOIN bronze.supply_orders so ON rs.retail_store_id = so.retail_store_id
+            LEFT JOIN bronze.supply_orders so ON CAST(rs.retail_store_id AS TEXT) = so.retail_store_id
             WHERE rs.store_status = 'active'
+            AND (so.quantity IS NULL OR so.quantity ~ '^[0-9]+$')
+            AND (so.total_invoice IS NULL OR so.total_invoice ~ '^[0-9]+\.?[0-9]*$')
             GROUP BY rs.retail_store_id, rs.store_name, rs.city, rs.region, rs.store_type
             ORDER BY total_revenue DESC NULLS LAST
         """)

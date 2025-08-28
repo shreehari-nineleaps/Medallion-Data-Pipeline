@@ -296,6 +296,8 @@ class GoldBuilder:
                         -- Product details (COALESCE to handle missing dims)
                         COALESCE(p.product_name, 'Unknown') as product_name,
                         COALESCE(p.product_category, 'Unknown') as product_category,
+                        COALESCE(p.main_category, 'Unknown') as main_category,
+                        COALESCE(p.sub_category, 'Unknown') as sub_category,
                         p.unit_cost,
                         p.selling_price,
                         (p.selling_price - p.unit_cost) as profit_margin,
@@ -416,6 +418,8 @@ class GoldBuilder:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_gscd_order_date ON gold.supply_chain_dashboard(order_date)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_gscd_order_year_month ON gold.supply_chain_dashboard(order_year_month)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_gscd_product_category ON gold.supply_chain_dashboard(product_category)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_gscd_main_category ON gold.supply_chain_dashboard(main_category)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_gscd_sub_category ON gold.supply_chain_dashboard(sub_category)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_gscd_supplier_name ON gold.supply_chain_dashboard(supplier_name)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_gscd_warehouse_region ON gold.supply_chain_dashboard(warehouse_region)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_gscd_store_region ON gold.supply_chain_dashboard(store_region)")
