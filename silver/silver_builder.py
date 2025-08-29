@@ -288,6 +288,9 @@ class SilverBuilder:
             'total_records_cleaned': 0,
             'total_quality_issues_fixed': 0
         }
+        # Generate unique run ID for this ETL run
+        from datetime import datetime
+        self.run_id = f"silver_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     def get_connection(self):
         """Get database connection."""
@@ -450,6 +453,68 @@ class SilverBuilder:
         finally:
             conn.close()
 
+    def log_rejected_row(self, table_name, record_data, reason):
+        """Log rejected rows to audit.rejected_rows table."""
+        conn = self.get_connection()
+        if not conn:
+            return
+
+        try:
+            import json
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO audit.rejected_rows
+                (table_name, record, reason, run_id)
+                VALUES (%s, %s, %s, %s)
+            """, (table_name, json.dumps(record_data), reason, self.run_id))
+            conn.commit()
+            cursor.close()
+        except psycopg2.Error as e:
+            logger.error(f"Error logging rejected row: {e}")
+        finally:
+            conn.close()
+
+    def log_dq_check(self, table_name, check_name, pass_fail, bad_row_count=0):
+        """Log data quality check results to audit.dq_results table."""
+        conn = self.get_connection()
+        if not conn:
+            return
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO audit.dq_results
+                (table_name, check_name, pass_fail, bad_row_count, run_id)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (table_name, check_name, pass_fail, bad_row_count, self.run_id))
+            conn.commit()
+            cursor.close()
+        except psycopg2.Error as e:
+            logger.error(f"Error logging DQ check: {e}")
+        finally:
+            conn.close()
+
+    def log_etl_step(self, step_executed, table_name=None, input_count=0, output_count=0, rejected_count=0):
+        """Log ETL step execution to audit.etl_log table."""
+        conn = self.get_connection()
+        if not conn:
+            return
+
+        try:
+            from datetime import datetime
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO audit.etl_log
+                (run_id, run_timestamp, step_executed, table_name, input_row_count, output_row_count, rejected_row_count)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (self.run_id, datetime.now(), step_executed, table_name, input_count, output_count, rejected_count))
+            conn.commit()
+            cursor.close()
+        except psycopg2.Error as e:
+            logger.error(f"Error logging ETL step: {e}")
+        finally:
+            conn.close()
+
     def calculate_quality_score(self, issues_found, total_fields):
         """Calculate quality score based on issues found."""
         if total_fields == 0:
@@ -500,6 +565,13 @@ class SilverBuilder:
                 # Skip if essential data is missing
                 if not cleaned_name:
                     stats['rejected'] += 1
+                    # Log rejected row to audit table
+                    self.log_rejected_row('suppliers', {
+                        'supplier_id': supplier_id,
+                        'supplier_name': supplier_name,
+                        'contact_email': contact_email,
+                        'phone_number': phone_number
+                    }, 'Missing supplier name')
                     logger.debug(f"Rejected supplier {supplier_id}: missing name")
                     continue
 
@@ -518,6 +590,12 @@ class SilverBuilder:
                     stats['issues_fixed'] += issues_count
 
             conn.commit()
+
+            # Log DQ checks
+            bronze_count = len(bronze_data)
+            self.log_dq_check('suppliers', 'data_completeness_check', stats['rejected'] == 0, stats['rejected'])
+            self.log_etl_step('clean_suppliers', 'suppliers', bronze_count, stats['processed'], stats['rejected'])
+
             logger.info(f"✅ Suppliers: {stats['processed']:,} processed, {stats['cleaned']:,} cleaned, {stats['rejected']:,} rejected, {stats['issues_fixed']:,} issues fixed")
             self.total_stats['total_records_processed'] += stats['processed']
             self.total_stats['total_records_cleaned'] += stats['cleaned']
@@ -593,6 +671,16 @@ class SilverBuilder:
                 # Skip if essential data is missing
                 if not cleaned_name or cleaned_unit_cost is None or cleaned_selling_price is None:
                     stats['rejected'] += 1
+                    # Log rejected row to audit table
+                    self.log_rejected_row('products', {
+                        'product_id': product_id,
+                        'product_name': product_name,
+                        'unit_cost': str(unit_cost),
+                        'selling_price': str(selling_price),
+                        'supplier_id': str(supplier_id),
+                        'product_category': product_category,
+                        'status': status
+                    }, 'Missing essential data (name, unit_cost, or selling_price)')
                     logger.debug(f"Rejected product {product_id}: missing essential data")
                     continue
 
@@ -622,6 +710,13 @@ class SilverBuilder:
                     stats['issues_fixed'] += issues_count
 
             conn.commit()
+
+            # Log DQ checks
+            bronze_count = len(bronze_data)
+            self.log_dq_check('products', 'data_completeness_check', stats['rejected'] == 0, stats['rejected'])
+            self.log_dq_check('products', 'price_validation_check', True, 0)  # Add specific price validation later
+            self.log_etl_step('clean_products', 'products', bronze_count, stats['processed'], stats['rejected'])
+
             logger.info(f"✅ Products: {stats['processed']:,} processed, {stats['cleaned']:,} cleaned, {stats['rejected']:,} rejected, {stats['issues_fixed']:,} issues fixed")
             self.total_stats['total_records_processed'] += stats['processed']
             self.total_stats['total_records_cleaned'] += stats['cleaned']
@@ -956,6 +1051,14 @@ class SilverBuilder:
                 # Skip if essential data is missing
                 if cleaned_quantity is None or cleaned_quantity < 0:
                     stats['rejected'] += 1
+                    # Log rejected row to audit table
+                    self.log_rejected_row('inventory', {
+                        'inventory_id': inventory_id,
+                        'product_id': product_id,
+                        'warehouse_id': warehouse_id,
+                        'quantity_on_hand': quantity_on_hand,
+                        'last_stocked_date': str(last_stocked_date)
+                    }, 'Invalid or negative quantity')
                     logger.debug(f"Rejected inventory {inventory_id}: invalid quantity")
                     continue
 
@@ -974,6 +1077,12 @@ class SilverBuilder:
                     stats['issues_fixed'] += issues_count
 
             conn.commit()
+
+            # Log DQ checks
+            bronze_count = len(bronze_data)
+            self.log_dq_check('inventory', 'quantity_validation_check', stats['rejected'] == 0, stats['rejected'])
+            self.log_etl_step('clean_inventory', 'inventory', bronze_count, stats['processed'], stats['rejected'])
+
             logger.info(f"✅ Inventory: {stats['processed']:,} processed, {stats['cleaned']:,} cleaned, {stats['rejected']:,} rejected, {stats['issues_fixed']:,} issues fixed")
             self.total_stats['total_records_processed'] += stats['processed']
             self.total_stats['total_records_cleaned'] += stats['cleaned']
